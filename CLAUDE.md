@@ -2,6 +2,8 @@
 
 This document contains implementation notes, architecture decisions, and technical details for contributors.
 
+> **Important**: Update this document whenever you make changes to the codebase. This helps maintain consistency and aids future contributors.
+
 ## Overview
 
 **Goal**: Convert mixed audio songs to separated parts, MIDI, and sheet music (MusicXML + PDF).
@@ -79,6 +81,39 @@ song2score render MUSICXML --out FILE [OPTIONS]
 | `score` | All transcribe options + `--map`, `--guitar-tab`, `--pdf`, `--musescore PATH` |
 | `render` | `--format pdf\|png\|svg`, `--resolution DPI`, `--auto-install-musescore` |
 
+## Lazy Loading and Warning Suppression
+
+**Important for CLI responsiveness**: The project uses lazy imports to avoid loading heavy dependencies (TensorFlow, Basic Pitch) at CLI startup.
+
+### Implementation
+
+**Files**: `song2score/__init__.py`, `song2score/__main__.py`, `song2score/pipeline.py`
+
+**Purpose**: Avoid warnings and slow startup when running commands like `--version` or `--help`
+
+**How it works**:
+1. `__init__.py` - Suppresses dependency warnings before any imports
+2. `__main__.py` - Lazy imports Pipeline and QuickTranscribe
+3. `pipeline.py` - Lazy imports transcribers via `_get_transcribers()`
+4. `basic_pitch.py` - Lazy imports Basic Pitch modules via `_import_basic_pitch()`
+
+**Warning Suppression**:
+```python
+# Environment variables (set before imports)
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # TensorFlow logging
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # oneDNN warnings
+
+# Warning filters
+warnings.filterwarnings('ignore', message='.*urllib3.*doesn\'t match.*')
+warnings.filterwarnings('ignore', message='.*chardet.*doesn\'t match.*')
+```
+
+### When Adding New Heavy Dependencies
+
+1. Add lazy import in the relevant module
+2. Add warning suppression if the dependency emits warnings on import
+3. Update this document
+
 ## Stem Separation
 
 ### Demucs Integration
@@ -98,13 +133,18 @@ song2score render MUSICXML --out FILE [OPTIONS]
 4. Float32 precision: MKL FFT doesn't support float16 on CPU
 5. CLI subprocess option: `use_cli=True` for better memory isolation
 
+**Mono Audio Handling**:
+- Demucs expects stereo input (2 channels)
+- Mono audio is automatically converted to stereo by duplicating the channel
+- Audio shape handling: `sf.read()` returns (samples, channels), always transpose to (channels, samples)
+
 **Usage**:
 ```python
 separator = DemucsSeparator(
-    model="htdemucs_ft",
-    segment_length=4.0,  # seconds
-    shifts=0,            # no shifts for memory
-    use_cli=False,       # or True for subprocess mode
+    model="htdemucs_ft",   # Default (lighter, ~2GB memory)
+    segment_length=4.0,    # seconds
+    shifts=0,              # no shifts for memory
+    use_cli=False,         # or True for subprocess mode
 )
 stems = separator.separate(input_path, output_dir)
 ```
@@ -169,7 +209,18 @@ instrument_map = {
 
 **Note**: music21 API has changed between versions. Current code uses:
 - `converter.parse()` for MIDI import (not `stream.converter.parse()`)
+- `clef.clefFromString(name)` for creating clefs (not `clef.Clef(name)`)
 - Direct Part manipulation for instrument updates
+
+**API Compatibility**:
+```python
+# Correct (v9+):
+part.insert(0, clef.clefFromString("treble"))
+part.insert(0, clef.TrebleClef())
+
+# Incorrect (old API):
+part.insert(0, clef.Clef("treble"))  # Raises TypeError
+```
 
 ## PDF Rendering
 
@@ -189,10 +240,22 @@ renderer = MuseScoreRenderer(auto_install=True)
 # Installs to ~/.local/bin/mscore
 ```
 
-**Command Line**:
+**Command Line Options** (version differences):
 ```bash
+# PDF output (all versions)
 mscore -o output.pdf input.musicxml
+
+# PNG output with resolution
+# MuseScore 2.x: -r for resolution
+mscore -o output.png -r 300 input.musicxml
+
+# MuseScore 3.x+: -T for trim, resolution via output extension
+mscore -o output-300dpi.png input.musicxml
 ```
+
+**PNG Output Notes**:
+- MuseScore 2.x adds page suffixes to multi-page PNGs: `score-1.png`, `score-2.png`, etc.
+- The renderer automatically detects and returns the first page when this occurs
 
 ## Type System
 
@@ -276,11 +339,31 @@ output/
    - Solution: Disabled by default on CPU
    - GPU can use float16 for memory savings
 
-3. **music21 API**: Various versions have different APIs
-   - Current: Uses `converter.parse()` directly
-   - Fixed import: Added `converter` to imports
+3. **MuseScore Version Compatibility**: Different versions use different CLI options
+   - MuseScore 2.x: `-r` for PNG resolution
+   - MuseScore 3.x+: Different options for PNG resolution
+   - Current code handles MuseScore 2.x correctly
+
+4. **Dependency Warnings**: Some transitive dependencies emit warnings
+   - Suppressed at import time for clean CLI output
+   - See "Lazy Loading and Warning Suppression" section above
 
 ## Development Notes
+
+### Version History
+
+See `CHANGELOG.md` for detailed version history.
+
+**Recent versions**:
+- **v0.2.0** (2026-03-13): Warning suppression, lazy imports, bug fixes
+  - Clean CLI startup (no TensorFlow/Basic Pitch warnings)
+  - Fixed mono audio handling
+  - Fixed music21 Clef API compatibility
+  - Fixed MuseScore 2.x PNG rendering
+  - Default model changed to `htdemucs_ft` (lower memory)
+
+- **v0.1.0** (Initial): Core functionality
+  - Stem separation, MIDI transcription, MusicXML/PDF export
 
 ### Adding a New Transcriber
 
@@ -301,6 +384,29 @@ output/
 2. Use streaming for file operations (don't load all at once)
 3. Explicit `gc.collect()` after large operations
 4. Use subprocess for isolation (`use_cli=True`)
+
+### Keeping Documentation Updated
+
+**IMPORTANT**: Whenever you make changes to the codebase:
+
+1. **Update CLAUDE.md** - This is the primary technical reference
+   - Document new modules, classes, or significant changes
+   - Update API compatibility notes if using external libraries
+   - Add any new configuration options or parameters
+
+2. **Update CHANGELOG.md** - Track user-visible changes
+   - Add new features under "Added"
+   - Document bug fixes under "Fixed"
+   - Note breaking changes under "Breaking"
+
+3. **Update README.md** if user-facing behavior changes
+   - New CLI options
+   - Changed default behavior
+   - New dependencies or system requirements
+
+4. **Update .gitignore** for new temporary files
+   - Add patterns for any new temp directories or cache files
+   - Exclude test outputs and large generated files
 
 ## Testing
 
