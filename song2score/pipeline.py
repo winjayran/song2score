@@ -13,8 +13,9 @@ This module orchestrates the entire workflow:
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Callable
 
 from song2score.types import (
     PartType,
@@ -26,6 +27,7 @@ from song2score.types import (
 from song2score.audio.preprocess import AudioPreprocessor
 from song2score.separation.demucs import DemucsSeparator
 from song2score.separation.strings import StringsSeparator
+from song2score.separation.classifier import InstrumentClassifier, classify_stem
 from song2score.export.musicxml import MusicXMLExporter
 from song2score.render.musescore import MuseScoreRenderer
 
@@ -60,6 +62,8 @@ class Pipeline:
         transcription_config: Optional[TranscriptionConfig] = None,
         export_config: Optional[ExportConfig] = None,
         device: Optional[str] = None,
+        parallel_transcription: bool = True,
+        max_transcription_workers: int = 3,
     ):
         """Initialize the pipeline.
 
@@ -69,6 +73,8 @@ class Pipeline:
             transcription_config: MIDI transcription configuration
             export_config: MusicXML export configuration
             device: Device to use (cpu, cuda, mps)
+            parallel_transcription: Whether to transcribe stems in parallel
+            max_transcription_workers: Max parallel transcription workers
         """
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -78,6 +84,8 @@ class Pipeline:
         self.export_config = export_config or ExportConfig()
 
         self.device = device
+        self.parallel_transcription = parallel_transcription
+        self.max_transcription_workers = max_transcription_workers
 
         # Initialize components
         self.preprocessor = AudioPreprocessor()
@@ -96,6 +104,41 @@ class Pipeline:
 
         self.exporter = MusicXMLExporter(self.export_config)
         self.renderer = MuseScoreRenderer()
+
+        # Instrument classifier for improved detection
+        self.classifier = InstrumentClassifier()
+
+        # Report
+        self.report = ProcessingReport(
+            output_dir=self.output_dir,
+        )
+
+    def _verify_and_correct_stem_classification(
+        self,
+        stems: Dict[PartType, Path],
+    ) -> Dict[PartType, Path]:
+        """Verify and log stem classifications using audio analysis.
+
+        This helps with debugging and understanding what's in each stem.
+        Note: We don't automatically reclassify because Demucs stems are
+        already well-separated, and isolated stems may have unexpected
+        characteristics (e.g., an isolated "vocals" stem might sound
+        string-like when analyzed in isolation).
+
+        Args:
+            stems: Dictionary of PartType to stem paths
+
+        Returns:
+            Original stems dictionary (unchanged)
+        """
+        for part_type, stem_path in stems.items():
+            # Classify the actual content of this stem
+            detected_part, confidence = classify_stem(stem_path)
+
+            logger.info(f"Stem '{part_type.value}' content detected as '{detected_part.value}' (confidence: {confidence:.2f})")
+
+        # Return stems unchanged - the Demucs classification is usually correct
+        return stems
 
         # Report
         self.report = ProcessingReport(
@@ -152,6 +195,49 @@ class Pipeline:
             self._drum_transcriber = DrumTranscriber()
         return self._drum_transcriber
 
+    def _transcribe_stem(
+        self,
+        part_type: PartType,
+        stem_path: Path,
+        midi_path: Path,
+    ) -> Tuple[PartType, Optional[Path], Optional[Dict], Optional[str]]:
+        """Transcribe a single stem to MIDI.
+
+        Args:
+            part_type: Type of part to transcribe
+            stem_path: Path to stem audio file
+            midi_path: Output MIDI file path
+
+        Returns:
+            Tuple of (part_type, midi_path, metadata, error)
+        """
+        try:
+            if part_type == PartType.DRUMS:
+                _, metadata = self.drum_transcriber.transcribe(stem_path, midi_path)
+
+            elif part_type == PartType.GUITAR:
+                _, metadata = self.guitar_transcriber.transcribe_guitar(stem_path, midi_path)
+
+            elif part_type == PartType.PIANO:
+                _, metadata = self.piano_transcriber.transcribe_piano(stem_path, midi_path)
+
+            elif part_type == PartType.STRINGS:
+                _, metadata = self.violin_transcriber.transcribe_violin(stem_path, midi_path)
+
+            else:
+                # Use basic pitch for vocals, bass, other
+                _, metadata = self.basic_pitch.transcribe(
+                    stem_path,
+                    midi_path,
+                    part_type,
+                )
+
+            return (part_type, midi_path, metadata, None)
+
+        except Exception as e:
+            logger.error(f"Failed to transcribe {part_type}: {e}")
+            return (part_type, None, None, str(e))
+
     def run(
         self,
         input_path: Path,
@@ -192,6 +278,11 @@ class Pipeline:
 
             self.report.stems_produced = stems
 
+            # Step 2b: Verify and correct stem classifications
+            logger.info("Step 2b: Verifying stem classifications...")
+            stems = self._verify_and_correct_stem_classification(stems)
+            self.report.stems_produced = stems
+
             # Step 3: Process strings from "other" if needed
             if PartType.OTHER in stems and (parts is None or PartType.STRINGS in parts):
                 logger.info("Step 2b: Extracting strings from 'other' stem...")
@@ -209,42 +300,44 @@ class Pipeline:
             midi_dir = self.output_dir / "midi"
             midi_dir.mkdir(exist_ok=True)
 
-            for part_type, stem_path in stems.items():
-                if parts and part_type not in parts:
-                    continue
+            # Filter stems to process
+            stems_to_process = [
+                (part_type, stem_path)
+                for part_type, stem_path in stems.items()
+                if not parts or part_type in parts
+            ]
 
-                midi_path = midi_dir / f"{part_type.value}.mid"
-
-                try:
-                    if part_type == PartType.DRUMS:
-                        # Use specialized drum transcriber
-                        _, metadata = self.drum_transcriber.transcribe(stem_path, midi_path)
-
-                    elif part_type == PartType.GUITAR:
-                        # Use specialized guitar transcriber
-                        _, metadata = self.guitar_transcriber.transcribe_guitar(stem_path, midi_path)
-
-                    elif part_type == PartType.PIANO:
-                        # Use specialized piano transcriber
-                        _, metadata = self.piano_transcriber.transcribe_piano(stem_path, midi_path)
-
-                    elif part_type == PartType.STRINGS:
-                        # Use specialized violin/strings transcriber
-                        _, metadata = self.violin_transcriber.transcribe_violin(stem_path, midi_path)
-
-                    else:
-                        # Use basic pitch for vocals, bass, other
-                        _, metadata = self.basic_pitch.transcribe(
-                            stem_path,
-                            midi_path,
+            if self.parallel_transcription and len(stems_to_process) > 1:
+                # Parallel transcription
+                logger.info(f"Transcribing {len(stems_to_process)} stems in parallel...")
+                with ThreadPoolExecutor(max_workers=self.max_transcription_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            self._transcribe_stem,
                             part_type,
-                        )
+                            stem_path,
+                            midi_dir / f"{part_type.value}.mid",
+                        ): part_type
+                        for part_type, stem_path in stems_to_process
+                    }
 
-                    self.report.midi_produced[part_type] = midi_path
-
-                except Exception as e:
-                    logger.error(f"Failed to transcribe {part_type}: {e}")
-                    self.report.errors.append(f"Transcription failed for {part_type}: {e}")
+                    for future in as_completed(futures):
+                        part_type, midi_path, metadata, error = future.result()
+                        if midi_path:
+                            self.report.midi_produced[part_type] = midi_path
+                        if error:
+                            self.report.errors.append(f"Transcription failed for {part_type}: {error}")
+            else:
+                # Sequential transcription
+                for part_type, stem_path in stems_to_process:
+                    midi_path = midi_dir / f"{part_type.value}.mid"
+                    part_type, midi_path, metadata, error = self._transcribe_stem(
+                        part_type, stem_path, midi_path
+                    )
+                    if midi_path:
+                        self.report.midi_produced[part_type] = midi_path
+                    if error:
+                        self.report.errors.append(f"Transcription failed for {part_type}: {error}")
 
             # Step 5: Export to MusicXML if we have MIDI files
             if self.report.midi_produced and self.export_config.parts:

@@ -6,8 +6,9 @@ import gc
 import logging
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -46,7 +47,8 @@ class DemucsSeparator:
         shifts: int = 0,  # No shifts to save memory
         use_float16: bool = False,  # Half precision - disabled (MKL FFT doesn't support it on CPU)
         use_cli: bool = False,  # Use CLI subprocess for better memory isolation
-        workers: int = 1,  # Single worker to save memory
+        workers: int = 1,  # Number of parallel workers (1 for low memory, 2-4 for faster)
+        max_parallel_segments: int = 2,  # Max segments to process in parallel
     ):
         """Initialize the Demucs separator.
 
@@ -57,7 +59,8 @@ class DemucsSeparator:
             shifts: Number of predictions with random shifts (0 saves memory)
             use_float16: Use half precision (only works with GPU, MKL FFT doesn't support on CPU)
             use_cli: Use demucs CLI subprocess (isolates memory better)
-            workers: Number of workers (1 recommended for low memory)
+            workers: Number of workers for demucs (1 recommended for low memory)
+            max_parallel_segments: Max segments to process in parallel (2-4 for speed)
         """
         self.model = model
         self.device = device or self._auto_detect_device()
@@ -67,6 +70,7 @@ class DemucsSeparator:
         self.use_float16 = use_float16 and self.device in ("cuda", "mps")
         self.use_cli = use_cli
         self.workers = workers
+        self.max_parallel_segments = max_parallel_segments
 
         # Determine number of stems based on model
         self._num_stems = 6 if "6s" in model else 4
@@ -126,46 +130,54 @@ class DemucsSeparator:
         temp_segments_dir = stems_output_dir / ".segments"
         temp_segments_dir.mkdir(exist_ok=True)
 
-        # Process each segment
-        for seg_idx in range(num_segments):
-            start_sample = seg_idx * segment_samples
-            end_sample = min(start_sample + segment_samples, total_samples)
+        # Process each segment (with parallel processing if enabled)
+        if self.max_parallel_segments > 1 and num_segments > 1:
+            logger.info(f"Processing {num_segments} segments with up to {self.max_parallel_segments} parallel workers")
+            self._process_segments_parallel(
+                input_path, sr, segment_samples, num_segments,
+                temp_segments_dir, total_samples
+            )
+        else:
+            # Sequential processing (original behavior)
+            for seg_idx in range(num_segments):
+                start_sample = seg_idx * segment_samples
+                end_sample = min(start_sample + segment_samples, total_samples)
 
-            # Read this segment with dtype=float32 for processing
-            segment_len = end_sample - start_sample
-            start_frame = start_sample
-            audio = sf.read(str(input_path), start=start_frame, frames=segment_len, always_2d=True, dtype='float32')[0]
+                # Read this segment with dtype=float32 for processing
+                segment_len = end_sample - start_sample
+                start_frame = start_sample
+                audio = sf.read(str(input_path), start=start_frame, frames=segment_len, always_2d=True, dtype='float32')[0]
 
-            # Convert to (channels, samples) format for demucs
-            # always_2d=True returns (samples, channels), so always transpose
-            audio = audio.T  # -> (channels, samples)
+                # Convert to (channels, samples) format for demucs
+                # always_2d=True returns (samples, channels), so always transpose
+                audio = audio.T  # -> (channels, samples)
 
-            # Demucs expects stereo input (2 channels), convert mono to stereo if needed
-            if audio.shape[0] == 1:
-                # Duplicate mono channel to create stereo
-                audio = np.repeat(audio, 2, axis=0)
+                # Demucs expects stereo input (2 channels), convert mono to stereo if needed
+                if audio.shape[0] == 1:
+                    # Duplicate mono channel to create stereo
+                    audio = np.repeat(audio, 2, axis=0)
 
-            logger.info(f"Processing segment {seg_idx + 1}/{num_segments} ({start_sample/sr:.1f}s - {end_sample/sr:.1f}s)")
+                logger.info(f"Processing segment {seg_idx + 1}/{num_segments} ({start_sample/sr:.1f}s - {end_sample/sr:.1f}s)")
 
-            # Process this segment
-            segment_sources = self._process_segment(audio, sr)
+                # Process this segment
+                segment_sources = self._process_segment(audio, sr)
 
-            # Save each stem segment immediately (streaming)
-            for i, stem_name in enumerate(self.stem_names):
-                stem_segment_dir = temp_segments_dir / stem_name
-                stem_segment_dir.mkdir(exist_ok=True)
+                # Save each stem segment immediately (streaming)
+                for i, stem_name in enumerate(self.stem_names):
+                    stem_segment_dir = temp_segments_dir / stem_name
+                    stem_segment_dir.mkdir(exist_ok=True)
 
-                stem_segment_file = stem_segment_dir / f"segment_{seg_idx:03d}.wav"
+                    stem_segment_file = stem_segment_dir / f"segment_{seg_idx:03d}.wav"
 
-                # Transpose back to (samples, channels) for saving
-                stem_audio = segment_sources[i].T
+                    # Transpose back to (samples, channels) for saving
+                    stem_audio = segment_sources[i].T
 
-                # Save segment
-                sf.write(str(stem_segment_file), stem_audio, sr)
+                    # Save segment
+                    sf.write(str(stem_segment_file), stem_audio, sr)
 
-            # Aggressive memory cleanup
-            del audio, segment_sources, stem_audio
-            gc.collect()
+                # Aggressive memory cleanup
+                del audio, segment_sources, stem_audio
+                gc.collect()
 
         # Stream concatenate segments for each stem (one at a time)
         logger.info("Concatenating segments...")
@@ -276,6 +288,116 @@ class DemucsSeparator:
             torch.cuda.empty_cache()
 
         return sources
+
+    def _process_segment_task(
+        self,
+        seg_idx: int,
+        input_path: Path,
+        sr: int,
+        segment_samples: int,
+        temp_segments_dir: Path,
+        total_samples: int,
+    ) -> Tuple[int, List[Path]]:
+        """Process a single segment - used for parallel processing.
+
+        Args:
+            seg_idx: Segment index
+            input_path: Input audio file path
+            sr: Sample rate
+            segment_samples: Number of samples per segment
+            temp_segments_dir: Temporary directory for segment stems
+            total_samples: Total samples in audio
+
+        Returns:
+            Tuple of (segment_index, list_of_stem_files)
+        """
+        start_sample = seg_idx * segment_samples
+        end_sample = min(start_sample + segment_samples, total_samples)
+
+        # Read this segment with dtype=float32 for processing
+        segment_len = end_sample - start_sample
+        start_frame = start_sample
+        audio = sf.read(str(input_path), start=start_frame, frames=segment_len, always_2d=True, dtype='float32')[0]
+
+        # Convert to (channels, samples) format for demucs
+        audio = audio.T  # -> (channels, samples)
+
+        # Demucs expects stereo input (2 channels), convert mono to stereo if needed
+        if audio.shape[0] == 1:
+            audio = np.repeat(audio, 2, axis=0)
+
+        logger.info(f"Processing segment {seg_idx + 1} ({start_sample/sr:.1f}s - {end_sample/sr:.1f}s)")
+
+        # Process this segment (load model for this thread)
+        segment_sources = self._process_segment(audio, sr)
+
+        # Save each stem segment immediately
+        stem_files = []
+        for i, stem_name in enumerate(self.stem_names):
+            stem_segment_dir = temp_segments_dir / stem_name
+            stem_segment_dir.mkdir(exist_ok=True)
+
+            stem_segment_file = stem_segment_dir / f"segment_{seg_idx:03d}.wav"
+
+            # Transpose back to (samples, channels) for saving
+            stem_audio = segment_sources[i].T
+
+            # Save segment
+            sf.write(str(stem_segment_file), stem_audio, sr)
+            stem_files.append(stem_segment_file)
+
+        # Aggressive memory cleanup
+        del audio, segment_sources, stem_audio
+        gc.collect()
+
+        return (seg_idx, stem_files)
+
+    def _process_segments_parallel(
+        self,
+        input_path: Path,
+        sr: int,
+        segment_samples: int,
+        num_segments: int,
+        temp_segments_dir: Path,
+        total_samples: int,
+    ) -> None:
+        """Process multiple segments in parallel using ThreadPoolExecutor.
+
+        Args:
+            input_path: Input audio file path
+            sr: Sample rate
+            segment_samples: Number of samples per segment
+            num_segments: Total number of segments
+            temp_segments_dir: Temporary directory for segment stems
+            total_samples: Total samples in audio
+        """
+        completed_count = 0
+
+        with ThreadPoolExecutor(max_workers=self.max_parallel_segments) as executor:
+            # Submit all tasks
+            futures = {
+                executor.submit(
+                    self._process_segment_task,
+                    seg_idx,
+                    input_path,
+                    sr,
+                    segment_samples,
+                    temp_segments_dir,
+                    total_samples,
+                ): seg_idx
+                for seg_idx in range(num_segments)
+            }
+
+            # Process as they complete
+            for future in as_completed(futures):
+                seg_idx = futures[future]
+                try:
+                    future.result()
+                    completed_count += 1
+                    logger.info(f"Completed {completed_count}/{num_segments} segments")
+                except Exception as e:
+                    logger.error(f"Segment {seg_idx} failed: {e}")
+                    raise
 
     def _separate_with_cli(
         self,

@@ -101,8 +101,25 @@ class MusicXMLExporter:
         if composer:
             score.metadata.composer = composer
 
-        # Process each part
-        for part_type, midi_path in midi_files.items():
+        # Process each part in a specific order for better layout
+        # Order: vocals, guitar, piano, bass, strings, drums, other
+        part_order = [
+            PartType.VOCALS,
+            PartType.GUITAR,
+            PartType.PIANO,
+            PartType.BASS,
+            PartType.STRINGS,
+            PartType.DRUMS,
+            PartType.OTHER,
+        ]
+
+        # Sort parts according to the order
+        sorted_parts = sorted(
+            midi_files.items(),
+            key=lambda x: part_order.index(x[0]) if x[0] in part_order else len(part_order)
+        )
+
+        for part_type, midi_path in sorted_parts:
             if part_type not in self.config.parts and self.config.parts:
                 continue
 
@@ -120,6 +137,11 @@ class MusicXMLExporter:
             )
 
             if part:
+                # Set part ID for proper staff identification
+                part.id = f"{part_type.value}_staff"
+                part.partName = mapped_instrument.replace("_", " ").title()
+                part.partAbbreviation = mapped_instrument[:8].replace("_", " ").title()
+
                 # Show debug info
                 logger.info(f"Adding part for {part_type.value}: {len(list(part.flatten().notes))} notes")
                 score.insert(part)
@@ -343,15 +365,58 @@ class MusicXMLExporter:
     def _add_layout(self, score: stream.Score) -> None:
         """Add layout information to the score.
 
+        Ensures each instrument is on a separate staff with proper spacing.
+
         Args:
             score: The score to add layout to
         """
-        # Add page layout
-        score.append(layout.PageLayout())
+        # Add page layout with proper margins
+        page_layout = layout.PageLayout()
+        page_layout.pageWidth = 2100  # Standard A4 width (tenths)
+        page_layout.pageHeight = 2970  # Standard A4 height (tenths)
+        page_layout.topMargin = 100
+        page_layout.bottomMargin = 100
+        page_layout.leftMargin = 100
+        page_layout.rightMargin = 100
+        score.append(page_layout)
 
-        # Add system layout for each part
+        # Add system layout and staff layout for each part
+        # This ensures each instrument gets its own staff
         for part in score.parts:
-            part.insert(0, layout.SystemLayout())
+            # System layout controls spacing between systems
+            system_layout = layout.SystemLayout()
+            system_layout.systemDistance = 80  # Distance between systems
+            part.insert(0, system_layout)
+
+            # Staff layout controls individual staff properties
+            # Each part gets its own staff
+            staff_layout = layout.StaffLayout()
+            staff_layout.staffDistance = 60  # Distance between staves in a system
+            part.insert(0, staff_layout)
+
+        # Add staff group for parts that should be connected (e.g., piano grand staff)
+        # For instruments like piano that use multiple staves
+        self._add_staff_groups(score)
+
+    def _add_staff_groups(self, score: stream.Score) -> None:
+        """Add staff groups for instruments that use multiple staves.
+
+        Args:
+            score: The score to add staff groups to
+        """
+        # Check if piano is present (uses grand staff - treble and bass)
+        for part in score.parts:
+            instr = part.getInstrument()
+            if instr and 'piano' in instr.instrumentName.lower():
+                # Piano uses a grand staff (bracketed together)
+                staff_group = layout.StaffGroup()
+                staff_group.symbol = "brace"  # Brace for piano grand staff
+                part.insert(0, staff_group)
+            elif instr and 'guitar' in instr.instrumentName.lower():
+                # Guitar can use a bracket for standard notation + TAB
+                staff_group = layout.StaffGroup()
+                staff_group.symbol = "bracket"
+                part.insert(0, staff_group)
 
     def export_single_midi(
         self,

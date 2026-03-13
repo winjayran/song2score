@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore', message='.*urllib3.*doesn\'t match.*')
 warnings.filterwarnings('ignore', message='.*chardet.*doesn\'t match.*')
 warnings.filterwarnings('ignore', message='.*charset_normalizer.*doesn\'t match.*')
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Lazy import Pipeline to avoid loading heavy dependencies at import time
 def __getattr__(name):

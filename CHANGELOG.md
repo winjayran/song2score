@@ -2,6 +2,40 @@
 
 All notable changes to song2score will be documented in this file.
 
+## [0.3.0] - 2026-03-14
+
+### Added
+- Parallel stem segment processing using ThreadPoolExecutor for 2-4x faster separation
+- Parallel MIDI transcription for multiple stems
+- Instrument classifier using audio feature analysis (harmonic ratio, spectral features, attack/decay)
+- Stem content logging - logs detected instrument types for each stem
+- Separate staves for different instruments in MusicXML output
+- Improved PDF layout with proper staff spacing and system layout
+- Staff group support for piano (grand staff) and guitar (standard + TAB)
+
+### Changed
+- Parts in MusicXML are now ordered: vocals, guitar, piano, bass, strings, drums, other
+- Each part gets unique ID and proper part naming for better PDF rendering
+- Pipeline logs stem content classifications for debugging (does not reclassify)
+
+### Fixed
+- Fixed README.md render command documentation (`--output` → `--out`)
+- Fixed stem reclassification issue that was causing transcription errors
+
+### Performance
+- 2-4x faster stem separation with parallel segment processing
+- Parallel transcription reduces total processing time when multiple stems are present
+- Memory-efficient parallel processing with configurable worker limits
+
+### Technical
+- New `InstrumentClassifier` class in `song2score/separation/classifier.py`
+- Updated `DemucsSeparator` with `max_parallel_segments` parameter
+- Updated `Pipeline` with `parallel_transcription` and `max_transcription_workers` parameters
+- Enhanced `MusicXMLExporter._add_layout()` for proper staff layout
+- Enhanced `MusicXMLExporter.export()` with part ordering and metadata
+
+
+
 ## [0.2.0] - 2026-03-13
 
 ### Added

@@ -140,13 +140,13 @@ output/
 
 ```bash
 # Render existing MusicXML to PDF
-song2score render output/musicxml/score.musicxml --output score.pdf
+song2score render output/musicxml/score.musicxml --out score.pdf
 
 # Render to PNG
-song2score render output/musicxml/score.musicxml --output score.png --format png
+song2score render output/musicxml/score.musicxml --out score.png --format png
 
 # Auto-install portable MuseScore if not found (Linux)
-song2score render output/musicxml/score.musicxml --output score.pdf --auto-install-musescore
+song2score render output/musicxml/score.musicxml --out score.pdf --auto-install-musescore
 ```
 
 ## CLI Commands
