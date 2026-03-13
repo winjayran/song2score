@@ -189,7 +189,8 @@ class MusicXMLExporter:
                 part.insert(0, instr)
 
                 clef_name = self._get_clef(part_type, mapped_instrument)
-                part.insert(0, clef.Clef(clef_name))
+                # Use clefFromString to create clef from string name
+                part.insert(0, clef.clefFromString(clef_name))
 
                 part.insert(0, meter.TimeSignature('4/4'))
                 part.insert(0, tempo.MetronomeMark(number=120))

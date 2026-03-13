@@ -7,13 +7,32 @@ that works well for guitar, piano, and other melodic instruments.
 """
 
 import logging
+import os
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Suppress warnings from basic-pitch dependencies
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+
+# Suppress basic-pitch optional dependency warnings
+logging.getLogger('root').setLevel(logging.CRITICAL)
+
 import numpy as np
 import soundfile as sf
-from basic_pitch.inference import predict_and_save
-from basic_pitch import ICASSP_2022_MODEL_PATH
+
+# Lazy import basic_pitch to suppress warnings
+def _import_basic_pitch():
+    """Lazy import basic_pitch with warning suppression."""
+    # Suppress the optional dependency warnings
+    warnings.filterwarnings('ignore', message='.*CoreML.*')
+    warnings.filterwarnings('ignore', message='.*tflite.*')
+    warnings.filterwarnings('ignore', message='.*ONNX.*')
+
+    from basic_pitch.inference import predict_and_save
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+    return predict_and_save, ICASSP_2022_MODEL_PATH
 
 from song2score.types import PartType
 
@@ -73,6 +92,17 @@ class BasicPitchTranscriber:
         },
     }
 
+    # Lazy loaded imports
+    _predict_and_save = None
+    _ICASSP_2022_MODEL_PATH = None
+
+    @classmethod
+    def _get_basic_pitch(cls):
+        """Lazy import basic_pitch modules."""
+        if cls._predict_and_save is None:
+            cls._predict_and_save, cls._ICASSP_2022_MODEL_PATH = _import_basic_pitch()
+        return cls._predict_and_save, cls._ICASSP_2022_MODEL_PATH
+
     def __init__(
         self,
         model_path: Optional[str] = None,
@@ -88,7 +118,8 @@ class BasicPitchTranscriber:
             minimum_note_length: Minimum note duration in seconds
             midi_tempo: Default tempo for output MIDI
         """
-        self.model_path = model_path or str(ICASSP_2022_MODEL_PATH)
+        _, model_path_default = self._get_basic_pitch()
+        self.model_path = model_path or str(model_path_default)
         self.confidence_threshold = confidence_threshold
         self.minimum_note_length = minimum_note_length
         self.midi_tempo = midi_tempo
@@ -128,6 +159,7 @@ class BasicPitchTranscriber:
         try:
             # Run Basic Pitch prediction
             # Note: predict_and_save outputs to a directory
+            predict_and_save, _ = self._get_basic_pitch()
             predict_and_save(
                 [str(audio_path)],
                 output_directory=str(temp_dir),

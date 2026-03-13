@@ -26,17 +26,28 @@ from song2score.types import (
 from song2score.audio.preprocess import AudioPreprocessor
 from song2score.separation.demucs import DemucsSeparator
 from song2score.separation.strings import StringsSeparator
-from song2score.transcription.basic_pitch import (
-    BasicPitchTranscriber,
-    GuitarTranscriber,
-    PianoTranscriber,
-    ViolinTranscriber,
-)
-from song2score.transcription.drums import DrumTranscriber
 from song2score.export.musicxml import MusicXMLExporter
 from song2score.render.musescore import MuseScoreRenderer
 
 logger = logging.getLogger(__name__)
+
+# Lazy imports for transcribers to avoid TensorFlow warnings on import
+def _get_transcribers():
+    """Lazy import transcribers to avoid TensorFlow warnings."""
+    from song2score.transcription.basic_pitch import (
+        BasicPitchTranscriber,
+        GuitarTranscriber,
+        PianoTranscriber,
+        ViolinTranscriber,
+    )
+    from song2score.transcription.drums import DrumTranscriber
+    return (
+        BasicPitchTranscriber,
+        GuitarTranscriber,
+        PianoTranscriber,
+        ViolinTranscriber,
+        DrumTranscriber,
+    )
 
 
 class Pipeline:
@@ -76,22 +87,12 @@ class Pipeline:
         )
         self.strings_separator = StringsSeparator()
 
-        # Initialize transcribers
-        self.basic_pitch = BasicPitchTranscriber(
-            confidence_threshold=self.transcription_config.confidence_threshold,
-            minimum_note_length=self.transcription_config.minimum_note_length,
-            midi_tempo=self.transcription_config.midi_tempo,
-        )
-        self.guitar_transcriber = GuitarTranscriber(
-            confidence_threshold=self.transcription_config.confidence_threshold,
-        )
-        self.piano_transcriber = PianoTranscriber(
-            confidence_threshold=self.transcription_config.confidence_threshold,
-        )
-        self.violin_transcriber = ViolinTranscriber(
-            confidence_threshold=self.transcription_config.confidence_threshold,
-        )
-        self.drum_transcriber = DrumTranscriber()
+        # Lazy initialize transcribers (will be created on first use)
+        self._basic_pitch = None
+        self._guitar_transcriber = None
+        self._piano_transcriber = None
+        self._violin_transcriber = None
+        self._drum_transcriber = None
 
         self.exporter = MusicXMLExporter(self.export_config)
         self.renderer = MuseScoreRenderer()
@@ -100,6 +101,56 @@ class Pipeline:
         self.report = ProcessingReport(
             output_dir=self.output_dir,
         )
+
+    @property
+    def basic_pitch(self):
+        """Lazy load basic pitch transcriber."""
+        if self._basic_pitch is None:
+            BasicPitchTranscriber, *_ = _get_transcribers()
+            self._basic_pitch = BasicPitchTranscriber(
+                confidence_threshold=self.transcription_config.confidence_threshold,
+                minimum_note_length=self.transcription_config.minimum_note_length,
+                midi_tempo=self.transcription_config.midi_tempo,
+            )
+        return self._basic_pitch
+
+    @property
+    def guitar_transcriber(self):
+        """Lazy load guitar transcriber."""
+        if self._guitar_transcriber is None:
+            _, GuitarTranscriber, *_ = _get_transcribers()
+            self._guitar_transcriber = GuitarTranscriber(
+                confidence_threshold=self.transcription_config.confidence_threshold,
+            )
+        return self._guitar_transcriber
+
+    @property
+    def piano_transcriber(self):
+        """Lazy load piano transcriber."""
+        if self._piano_transcriber is None:
+            _, _, PianoTranscriber, *_ = _get_transcribers()
+            self._piano_transcriber = PianoTranscriber(
+                confidence_threshold=self.transcription_config.confidence_threshold,
+            )
+        return self._piano_transcriber
+
+    @property
+    def violin_transcriber(self):
+        """Lazy load violin transcriber."""
+        if self._violin_transcriber is None:
+            _, _, _, ViolinTranscriber, _ = _get_transcribers()
+            self._violin_transcriber = ViolinTranscriber(
+                confidence_threshold=self.transcription_config.confidence_threshold,
+            )
+        return self._violin_transcriber
+
+    @property
+    def drum_transcriber(self):
+        """Lazy load drum transcriber."""
+        if self._drum_transcriber is None:
+            *_, DrumTranscriber = _get_transcribers()
+            self._drum_transcriber = DrumTranscriber()
+        return self._drum_transcriber
 
     def run(
         self,

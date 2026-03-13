@@ -212,7 +212,7 @@ class MuseScoreRenderer:
 
         # Add format option for PNG
         if output_format.lower() == "png":
-            cmd.extend(["-T", str(resolution)])
+            cmd.extend(["-r", str(resolution)])
 
         # Input file
         cmd.append(str(musicxml_path))
@@ -234,20 +234,35 @@ class MuseScoreRenderer:
 
             # Check if output was created
             if not output_path.exists():
-                # MuseScore might have created a file with different extension
-                # Check for .pdf if we requested .png, or vice versa
-                alt_extensions = ["pdf", "png", "svg", "mxl"]
-                found = False
+                # MuseScore might have created a file with:
+                # 1. Different extension
+                # 2. Page number suffix (e.g., score-1.png for multi-page PNG)
 
-                for ext in alt_extensions:
-                    alt_path = output_path.with_suffix(f".{ext}")
-                    if alt_path.exists():
-                        output_path = alt_path
-                        found = True
+                # First, check for the expected extension with page suffixes
+                output_dir = output_path.parent
+                output_stem = output_path.stem
+                output_ext = output_path.suffix
+
+                # Check for files with page suffix (e.g., score-1.png, score-2.png)
+                for i in range(1, 10):  # Check up to 10 pages
+                    page_path = output_dir / f"{output_stem}-{i}{output_ext}"
+                    if page_path.exists():
+                        # For multi-page output, return the first page
+                        output_path = page_path
                         break
-
-                if not found:
-                    raise RuntimeError(f"MuseScore did not create output file")
+                else:
+                    # No page suffix found, check for different extensions
+                    # Prefer the requested format first
+                    alt_extensions = [output_ext.lstrip("."), "pdf", "png", "svg", "mxl"]
+                    for ext in alt_extensions:
+                        if ext == output_ext.lstrip("."):
+                            continue  # Skip original extension we already checked
+                        alt_path = output_path.with_suffix(f".{ext}")
+                        if alt_path.exists():
+                            output_path = alt_path
+                            break
+                    else:
+                        raise RuntimeError(f"MuseScore did not create output file at {output_path}")
 
             metadata = {
                 "format": output_format,

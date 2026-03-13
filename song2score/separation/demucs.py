@@ -137,8 +137,13 @@ class DemucsSeparator:
             audio = sf.read(str(input_path), start=start_frame, frames=segment_len, always_2d=True, dtype='float32')[0]
 
             # Convert to (channels, samples) format for demucs
-            if audio.shape[1] == 2:  # (samples, channels)
-                audio = audio.T  # -> (channels, samples)
+            # always_2d=True returns (samples, channels), so always transpose
+            audio = audio.T  # -> (channels, samples)
+
+            # Demucs expects stereo input (2 channels), convert mono to stereo if needed
+            if audio.shape[0] == 1:
+                # Duplicate mono channel to create stereo
+                audio = np.repeat(audio, 2, axis=0)
 
             logger.info(f"Processing segment {seg_idx + 1}/{num_segments} ({start_sample/sr:.1f}s - {end_sample/sr:.1f}s)")
 

@@ -13,10 +13,27 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from song2score import __version__
 from song2score.types import PartType
-from song2score.pipeline import Pipeline, QuickTranscribe
 from song2score.export.musicxml import MusicXMLExporter
 from song2score.render.musescore import MuseScoreRenderer
 from song2score.audio.preprocess import AudioPreprocessor
+
+# Lazy import Pipeline to avoid basic-pitch/TensorFlow warnings on CLI startup
+_pipeline = None
+
+
+def _get_pipeline():
+    """Lazy import and return Pipeline."""
+    global _pipeline
+    if _pipeline is None:
+        from song2score.pipeline import Pipeline
+        _pipeline = Pipeline
+    return _pipeline
+
+
+def _get_quick_transcribe():
+    """Lazy import and return QuickTranscribe."""
+    from song2score.pipeline import QuickTranscribe
+    return QuickTranscribe
 
 app = typer.Typer(
     name="song2score",
@@ -135,6 +152,7 @@ def transcribe(
         status.update("Transcribing audio...")
 
         try:
+            QuickTranscribe = _get_quick_transcribe()
             report = QuickTranscribe.transcribe(
                 input_path=input,
                 output_dir=out,
@@ -444,6 +462,7 @@ def score(
         status.update("Transcribing and exporting...")
 
         try:
+            QuickTranscribe = _get_quick_transcribe()
             report = QuickTranscribe.to_score(
                 input_path=input,
                 output_dir=out,

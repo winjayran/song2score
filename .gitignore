@@ -127,8 +127,11 @@ test_output/
 *.log
 .cache/
 
-# Demucs cache
+# Demucs cache and temp files
 .demucs_cache/
+.segments/
+.basic_pitch_temp/
+preprocessed.wav
 
 # Model downloads
 checkpoints/
@@ -152,3 +155,6 @@ test_audio/
 
 # Local configuration
 .local/
+
+# Auto-generated files
+report.json

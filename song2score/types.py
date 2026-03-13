@@ -29,7 +29,7 @@ class StemConfig(BaseModel):
         default_factory=lambda: [PartType.VOCALS, PartType.DRUMS, PartType.BASS, PartType.OTHER],
         description="Parts to extract",
     )
-    model: str = Field(default="htdemucs", description="Demucs model name")
+    model: str = Field(default="htdemucs_ft", description="Demucs model name (htdemucs_ft for lower memory)")
 
 
 class TranscriptionConfig(BaseModel):
