@@ -28,6 +28,7 @@ from song2score.audio.preprocess import AudioPreprocessor
 from song2score.separation.demucs import DemucsSeparator
 from song2score.separation.strings import StringsSeparator
 from song2score.separation.classifier import InstrumentClassifier, classify_stem
+from song2score.separation.refinement import StemRefiner
 from song2score.export.musicxml import MusicXMLExporter
 from song2score.render.musescore import MuseScoreRenderer
 
@@ -62,8 +63,10 @@ class Pipeline:
         transcription_config: Optional[TranscriptionConfig] = None,
         export_config: Optional[ExportConfig] = None,
         device: Optional[str] = None,
-        parallel_transcription: bool = True,
+        parallel_transcription: bool = False,  # Disabled by default due to TensorFlow/Basic Pitch thread safety
         max_transcription_workers: int = 3,
+        stem_remap: Optional[Dict[PartType, PartType]] = None,
+        refine_stems: bool = False,
     ):
         """Initialize the pipeline.
 
@@ -75,6 +78,8 @@ class Pipeline:
             device: Device to use (cpu, cuda, mps)
             parallel_transcription: Whether to transcribe stems in parallel
             max_transcription_workers: Max parallel transcription workers
+            stem_remap: Manual mapping of stem files to part types (e.g., {PartType.VOCALS: PartType.DRUMS})
+            refine_stems: Whether to apply stem refinement to clean up mixed audio
         """
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +91,8 @@ class Pipeline:
         self.device = device
         self.parallel_transcription = parallel_transcription
         self.max_transcription_workers = max_transcription_workers
+        self.stem_remap = stem_remap or {}
+        self.refine_stems = refine_stems
 
         # Initialize components
         self.preprocessor = AudioPreprocessor()
@@ -94,6 +101,7 @@ class Pipeline:
             device=self.device,
         )
         self.strings_separator = StringsSeparator()
+        self.stem_refiner = StemRefiner() if refine_stems else None
 
         # Lazy initialize transcribers (will be created on first use)
         self._basic_pitch = None
@@ -116,34 +124,147 @@ class Pipeline:
     def _verify_and_correct_stem_classification(
         self,
         stems: Dict[PartType, Path],
+        auto_correct: bool = True,
+        min_confidence: float = 0.65,
     ) -> Dict[PartType, Path]:
-        """Verify and log stem classifications using audio analysis.
+        """Verify and optionally correct stem classifications using audio analysis.
 
-        This helps with debugging and understanding what's in each stem.
-        Note: We don't automatically reclassify because Demucs stems are
-        already well-separated, and isolated stems may have unexpected
-        characteristics (e.g., an isolated "vocals" stem might sound
-        string-like when analyzed in isolation).
+        This analyzes the actual content of each stem and can reassign stems
+        to different part types based on their actual instrument content.
+        This helps when Demucs misassigns instruments (e.g., guitar in "other").
+
+        NOTE: This is CONSERVATIVE - it only reclassifies the "other" stem to avoid
+        breaking valid stem assignments. For more aggressive reclassification, use
+        the --remap-stems option.
+
+        Args:
+            stems: Dictionary of PartType to stem paths
+            auto_correct: If True, reclassify "other" stem when confidence is high
+            min_confidence: Minimum confidence for auto-correction
+
+        Returns:
+            Corrected stems dictionary
+        """
+        # Only perform reclassification on "other" stem to find missing instruments
+        # This is conservative - we only reclassify "other" to avoid breaking valid stems
+        if PartType.OTHER in stems:
+            other_stem_path = stems[PartType.OTHER]
+            detected_part, confidence = classify_stem(other_stem_path)
+            logger.info(f"Stem 'other' content detected as '{detected_part.value}' (confidence: {confidence:.2f})")
+
+            # Only reclassify if confidence is high AND detected type doesn't already exist
+            if auto_correct and confidence >= min_confidence and detected_part != PartType.OTHER:
+                if detected_part not in stems:
+                    logger.info(f"Reclassifying 'other' -> '{detected_part.value}' (confidence: {confidence:.2f})")
+                    # Create new stems dict with reclassification
+                    corrected_stems = dict(stems)
+                    del corrected_stems[PartType.OTHER]
+                    corrected_stems[detected_part] = other_stem_path
+                    return corrected_stems
+                else:
+                    logger.info(f"Not reclassifying 'other' -> '{detected_part.value}' (type already exists)")
+            else:
+                logger.info(f"Keeping 'other' stem (confidence: {confidence:.2f} < {min_confidence} or no correction)")
+
+        return stems
+
+    def _apply_stem_remapping(
+        self,
+        stems: Dict[PartType, Path],
+        remap: Dict[PartType, PartType],
+    ) -> Dict[PartType, Path]:
+        """Apply manual stem remapping based on user specification.
+
+        This allows users to manually correct Demucs misclassifications by specifying
+        which stem file should be treated as which instrument type.
+
+        Args:
+            stems: Dictionary of PartType to stem paths
+            remap: Dictionary mapping original PartType to target PartType
+
+        Returns:
+            Remapped stems dictionary
+
+        Example:
+            If remap = {PartType.VOCALS: PartType.DRUMS, PartType.OTHER: PartType.VOCALS}
+            Then vocals.wav will be transcribed as drums, and other.wav as vocals.
+        """
+        remapped_stems = {}
+        remapping_log = []
+
+        # Track which target types are already assigned
+        assigned_targets = set()
+
+        for original_type, stem_path in stems.items():
+            # Check if this stem should be remapped
+            if original_type in remap:
+                target_type = remap[original_type]
+                remapping_log.append(f"{original_type.value} -> {target_type.value}")
+
+                # Check if target is already assigned (conflict)
+                if target_type in assigned_targets:
+                    logger.warning(f"Conflict: Multiple stems mapped to {target_type.value}, using last one")
+
+                remapped_stems[target_type] = stem_path
+                assigned_targets.add(target_type)
+            else:
+                # Check if this original type was the target of a remapping
+                # If someone else mapped to this type, we need to skip it
+                is_target_of_remap = any(remap[t] == original_type for t in remap if t in stems)
+                if is_target_of_remap:
+                    logger.info(f"Skipping {original_type.value} stem (remapped to another type)")
+                else:
+                    remapped_stems[original_type] = stem_path
+                    assigned_targets.add(original_type)
+
+        # Log remapping
+        if remapping_log:
+            logger.info(f"Applied manual stem remapping:")
+            for log_entry in remapping_log:
+                logger.info(f"  {log_entry}")
+
+        return remapped_stems
+
+    def _refine_stems(
+        self,
+        stems: Dict[PartType, Path],
+    ) -> Dict[PartType, Path]:
+        """Refine stems to remove unwanted content from other instruments.
+
+        This applies HPSS and frequency filtering to clean up stems that
+        contain residual audio from other instruments.
 
         Args:
             stems: Dictionary of PartType to stem paths
 
         Returns:
-            Original stems dictionary (unchanged)
+            Dictionary of PartType to refined stem paths
         """
+        if not self.stem_refiner:
+            return stems
+
+        refined_stems = {}
+
         for part_type, stem_path in stems.items():
-            # Classify the actual content of this stem
-            detected_part, confidence = classify_stem(stem_path)
+            try:
+                # Apply refinement
+                refined_path, metadata = self.stem_refiner.refine_stem(
+                    stem_path,
+                    part_type,
+                    stem_path,  # Overwrite original
+                )
+                refined_stems[part_type] = refined_path
 
-            logger.info(f"Stem '{part_type.value}' content detected as '{detected_part.value}' (confidence: {confidence:.2f})")
+                logger.info(f"Refined {part_type.value} stem")
+                if metadata.get("frequency_filter"):
+                    logger.info(f"  Frequency filter: {metadata['frequency_filter']}")
 
-        # Return stems unchanged - the Demucs classification is usually correct
-        return stems
+            except Exception as e:
+                logger.warning(f"Failed to refine {part_type.value} stem: {e}")
+                # Keep original stem
+                refined_stems[part_type] = stem_path
 
-        # Report
-        self.report = ProcessingReport(
-            output_dir=self.output_dir,
-        )
+        return refined_stems
 
     @property
     def basic_pitch(self):
@@ -234,6 +355,10 @@ class Pipeline:
 
             return (part_type, midi_path, metadata, None)
 
+        except ValueError as e:
+            # ValueError is raised for empty/silent audio - skip this stem
+            logger.warning(f"Skipping {part_type} transcription: {e}")
+            return (part_type, None, None, f"Skipped: {e}")
         except Exception as e:
             logger.error(f"Failed to transcribe {part_type}: {e}")
             return (part_type, None, None, str(e))
@@ -278,10 +403,26 @@ class Pipeline:
 
             self.report.stems_produced = stems
 
-            # Step 2b: Verify and correct stem classifications
-            logger.info("Step 2b: Verifying stem classifications...")
-            stems = self._verify_and_correct_stem_classification(stems)
+            # Step 2b: Apply manual stem remapping (if specified)
+            if self.stem_remap:
+                logger.info("Step 2b: Applying manual stem remapping...")
+                stems = self._apply_stem_remapping(stems, self.stem_remap)
+                self.report.stems_produced = stems
+
+            # Step 2c: Verify and correct stem classifications based on audio content
+            logger.info("Step 2c: Verifying stem classifications...")
+            stems = self._verify_and_correct_stem_classification(
+                stems,
+                auto_correct=True,  # Enable auto-correction
+                min_confidence=0.65,  # Minimum confidence for correction
+            )
             self.report.stems_produced = stems
+
+            # Step 2d: Refine stems to remove unwanted content (if enabled)
+            if self.refine_stems:
+                logger.info("Step 2d: Refining stems to remove unwanted content...")
+                stems = self._refine_stems(stems)
+                self.report.stems_produced = stems
 
             # Step 3: Process strings from "other" if needed
             if PartType.OTHER in stems and (parts is None or PartType.STRINGS in parts):

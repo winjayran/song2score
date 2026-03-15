@@ -441,6 +441,89 @@ class MusicXMLExporter:
             output_path,
         )
 
+    def export_separate_parts(
+        self,
+        midi_files: Dict[PartType, Path],
+        output_dir: Path,
+        title: Optional[str] = None,
+        composer: Optional[str] = None,
+    ) -> Dict[PartType, Path]:
+        """Export each MIDI file to a separate MusicXML file.
+
+        This creates individual MusicXML files for each part, suitable for
+        generating separate PDFs for each instrument.
+
+        Args:
+            midi_files: Dictionary mapping PartType to MIDI file paths
+            output_dir: Output directory for MusicXML files
+            title: Score title
+            composer: Score composer
+
+        Returns:
+            Dictionary mapping PartType to output MusicXML file paths
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        title = title or self.config.title
+        composer = composer or self.config.composer
+
+        exported_files = {}
+
+        for part_type, midi_path in midi_files.items():
+            if part_type not in self.config.parts and self.config.parts:
+                continue
+
+            # Create individual part file name
+            part_filename = f"{part_type.value}.musicxml"
+            part_output_path = output_dir / part_filename
+
+            # Get instrument mapping
+            mapped_instrument = self.config.instrument_map.get(
+                part_type,
+                part_type.value,
+            )
+
+            try:
+                # Create a single-part score
+                score = stream.Score()
+
+                # Set metadata
+                score.metadata = m21_metadata.Metadata()
+                score.metadata.title = f"{title} - {mapped_instrument.replace('_', ' ').title()}"
+                if composer:
+                    score.metadata.composer = composer
+
+                # Create part
+                part = self._create_part_from_midi(
+                    midi_path,
+                    part_type,
+                    mapped_instrument,
+                )
+
+                if part:
+                    part.id = f"{part_type.value}_staff"
+                    part.partName = mapped_instrument.replace("_", " ").title()
+                    part.partAbbreviation = mapped_instrument[:8].replace("_", " ").title()
+
+                    score.insert(part)
+
+                    # Add layout
+                    self._add_layout(score)
+
+                    # Write MusicXML
+                    score.write("musicxml", str(part_output_path))
+
+                    logger.info(f"Exported part {part_type.value} to {part_output_path}")
+                    exported_files[part_type] = part_output_path
+                else:
+                    logger.warning(f"Failed to create part for {part_type.value}")
+
+            except Exception as e:
+                logger.error(f"Failed to export part {part_type.value}: {e}")
+
+        return exported_files
+
     def set_instrument_map(self, instrument_map: Dict[PartType, str]) -> None:
         """Set the instrument mapping for export.
 

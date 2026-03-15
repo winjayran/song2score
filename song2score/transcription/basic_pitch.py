@@ -124,6 +124,39 @@ class BasicPitchTranscriber:
         self.minimum_note_length = minimum_note_length
         self.midi_tempo = midi_tempo
 
+    def _has_sufficient_audio(self, audio: np.ndarray, sr: int, min_duration: float = 0.5) -> Tuple[bool, str]:
+        """Check if audio has sufficient content for transcription.
+
+        Args:
+            audio: Audio array (mono)
+            sr: Sample rate
+            min_duration: Minimum duration in seconds
+
+        Returns:
+            Tuple of (has_content, reason)
+        """
+        # Check duration
+        duration = len(audio) / sr
+        if duration < min_duration:
+            return False, f"Audio too short ({duration:.2f}s < {min_duration}s)"
+
+        # Check if audio is mostly silent
+        # RMS (root mean square) energy
+        rms = np.sqrt(np.mean(audio ** 2))
+        if rms < 0.001:
+            return False, f"Audio too quiet (RMS={rms:.6f})"
+
+        # Check for any significant audio signal
+        # Count samples above noise floor
+        above_noise = np.abs(audio) > 0.01
+        significant_samples = np.sum(above_noise)
+        significant_ratio = significant_samples / len(audio)
+
+        if significant_ratio < 0.01:
+            return False, f"Audio mostly silent ({significant_ratio:.1%} above noise floor)"
+
+        return True, "OK"
+
     def transcribe(
         self,
         audio_path: Path,
@@ -141,6 +174,9 @@ class BasicPitchTranscriber:
 
         Returns:
             Tuple of (output_midi_path, metadata_dict)
+
+        Raises:
+            ValueError: If audio has insufficient content for transcription
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +188,12 @@ class BasicPitchTranscriber:
         if audio.ndim == 2:
             audio = np.mean(audio, axis=1)
 
+        # Validate audio has sufficient content
+        has_content, reason = self._has_sufficient_audio(audio, sr)
+        if not has_content:
+            logger.warning(f"Skipping transcription of {audio_path}: {reason}")
+            raise ValueError(f"Audio has insufficient content for transcription: {reason}")
+
         # Create output directory for temporary files
         temp_dir = output_path.parent / ".basic_pitch_temp"
         temp_dir.mkdir(exist_ok=True)
@@ -160,21 +202,35 @@ class BasicPitchTranscriber:
             # Run Basic Pitch prediction
             # Note: predict_and_save outputs to a directory
             predict_and_save, _ = self._get_basic_pitch()
-            predict_and_save(
-                [str(audio_path)],
-                output_directory=str(temp_dir),
-                save_midi=True,
-                sonify_midi=False,
-                save_model_outputs=False,
-                save_notes=True,  # Save note outputs
-                model_or_model_path=self.model_path,
-                onset_threshold=self.confidence_threshold,  # For note onset detection
-                frame_threshold=0.3,  # For frame-level note detection
-                minimum_note_length=int(self.minimum_note_length * 22050),  # Convert seconds to samples (at 44.1kHz)
-                minimum_frequency=50.0,  # Minimum fundamental frequency (Hz)
-                maximum_frequency=2000.0,  # Maximum fundamental frequency (Hz)
-                midi_tempo=self.midi_tempo,
-            )
+
+            # Capture any output/errors from basic_pitch
+            import io
+            import sys
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+
+            try:
+                # Note: model_or_model_path is a positional argument in current API
+                predict_and_save(
+                    [str(audio_path)],
+                    str(temp_dir),
+                    True,  # save_midi
+                    False,  # sonify_midi
+                    False,  # save_model_outputs
+                    True,  # save_notes
+                    self.model_path,  # model_or_model_path (positional)
+                    onset_threshold=self.confidence_threshold,  # For note onset detection
+                    frame_threshold=0.3,  # For frame-level note detection
+                    minimum_note_length=int(self.minimum_note_length * 22050),  # Convert seconds to samples (at 44.1kHz)
+                    minimum_frequency=50.0,  # Minimum fundamental frequency (Hz)
+                    maximum_frequency=2000.0,  # Maximum fundamental frequency (Hz)
+                    midi_tempo=self.midi_tempo,
+                )
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
 
             # Find the generated MIDI file
             # Basic Pitch names it after the input file
@@ -185,6 +241,26 @@ class BasicPitchTranscriber:
                 generated_midi = temp_dir / f"{audio_path.stem}.mid"
 
             if generated_midi.exists():
+                # Validate the MIDI file has content
+                try:
+                    import mido
+                    mid = mido.MidiFile(str(generated_midi))
+                    # Check if MIDI has any notes
+                    has_notes = False
+                    for track in mid.tracks:
+                        for msg in track:
+                            if msg.type == 'note_on' and msg.velocity > 0:
+                                has_notes = True
+                                break
+                        if has_notes:
+                            break
+
+                    if not has_notes:
+                        logger.warning(f"Basic Pitch generated empty MIDI for {audio_path}")
+                        raise ValueError("Generated MIDI contains no notes")
+                except Exception as e:
+                    logger.warning(f"Could not validate MIDI content: {e}")
+
                 # Move to desired output path
                 generated_midi.rename(output_path)
 
@@ -206,8 +282,17 @@ class BasicPitchTranscriber:
 
                 return output_path, metadata
             else:
-                raise FileNotFoundError(f"Basic Pitch did not generate MIDI file")
+                # List what files were created
+                temp_files = list(temp_dir.glob("*"))
+                logger.error(f"Basic Pitch did not generate expected MIDI. Files in temp dir: {[f.name for f in temp_files]}")
+                raise FileNotFoundError(f"Basic Pitch did not generate MIDI file (expected {generated_midi.name})")
 
+        except ValueError:
+            # Re-raise ValueError as-is (includes our custom errors)
+            raise
+        except Exception as e:
+            logger.error(f"Basic Pitch transcription failed for {audio_path}: {e}")
+            raise RuntimeError(f"Basic Pitch transcription failed: {e}")
         finally:
             # Clean up temp directory
             import shutil

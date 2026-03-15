@@ -2,6 +2,82 @@
 
 All notable changes to song2score will be documented in this file.
 
+## [0.5.0] - 2026-03-15
+
+### Added
+- Stem refinement module to clean up mixed audio in separated stems
+  - Harmonic-Percussive Source Separation (HPSS) to separate melodic and percussive content
+  - Frequency band filtering to isolate instrument-specific frequency ranges
+  - New `--refine-stems` CLI option for `transcribe` and `score` commands
+  - Specialized refinement functions for vocals (remove drum bleed) and bass (remove high frequencies)
+- New `StemRefiner` class in `song2score/separation/refinement.py`
+  - Configurable HPSS margin, frequency filtering, and harmonic/percussive masking
+  - Per-instrument frequency range optimization
+- New `--model` CLI option to specify Demucs model directly
+- New `--remap-stems` CLI option for manual stem reassignment
+- Improved vocals detection with specialized feature scoring
+  - Vocal-specific feature analysis (spectral centroid, onset rate, MFCCs)
+  - Distinguishes vocals from strings/guitar based on speech-like patterns
+- CLI improvements: `--model` and `--remap-stems` options for `transcribe` and `score` commands
+
+### Fixed
+- **Critical**: Fixed phantom stem creation bug where reclassification would create invalid mappings like `strings -> guitar.wav`
+- Stem reclassification is now conservative - only reclassifies "other" stem to avoid breaking valid assignments
+- Improved vocals detection to reduce misclassification as strings
+- Updated feature ranges to better distinguish between vocals and strings instruments
+- Report generation now correctly maps stem types to file paths without phantom assignments
+
+### Changed
+- Pipeline now supports optional stem refinement via `refine_stems` parameter
+- Stem refinement is applied after classification but before transcription
+- `_verify_and_correct_stem_classification()` simplified to only reclassify "other" stem
+- Improved classification feature ranges for vocals vs strings distinction
+- Stem separation defaults: `--stems 4` uses `htdemucs_ft`, `--stems 6` uses `htdemucs_6s`
+
+### Technical
+- New `song2score/separation/refinement.py` module with HPSS and frequency filtering
+- Updated `InstrumentClassifier._check_vocals_specific()` for improved vocals detection
+- Updated `InstrumentClassifier.FEATURE_RANGES` with better vocals/strings distinction
+- Updated Pipeline to include `_refine_stems()` method
+- Updated CLI `transcribe` and `score` commands with `--refine-stems`, `--model`, `--remap-stems` options
+- Documentation updates for stem refinement feature and manual stem remapping
+
+## [0.4.0] - 2026-03-14
+
+### Added
+- Stem reclassification based on audio content analysis
+  - Automatically corrects misclassified stems when confidence is high (>65%)
+  - Uses InstrumentClassifier to detect actual instrument types in each stem
+  - Helps when Demucs incorrectly assigns instruments (e.g., guitar in "other")
+- Separate MusicXML export for individual instrument parts
+  - New `--separate-parts` flag for `export` and `score` commands
+  - Creates individual MusicXML files for each instrument part
+- Separate PDF generation for each part
+  - New `--separate-parts` flag for `render` command
+  - Generate individual PDFs for each instrument part
+
+### Fixed
+- MIDI transcription errors for empty or silent stems
+  - Added audio validation before transcription to detect empty/quiet/silent audio
+  - Gracefully skips stems with insufficient content instead of failing
+  - Better error messages for transcription failures
+- Improved error handling in Basic Pitch transcription
+  - Validates generated MIDI files have actual notes
+  - Catches ValueError for empty audio and skips gracefully
+  - Reports useful error messages when transcription fails
+
+### Changed
+- Stem reclassification is now enabled by default with confidence threshold
+- Pipeline now auto-corrects stem classifications when confidence is high
+- Transcription errors are logged as warnings instead of failing the entire pipeline
+
+### Technical
+- New `_has_sufficient_audio()` method in BasicPitchTranscriber for audio validation
+- Updated `_verify_and_correct_stem_classification()` in Pipeline to support auto-correction
+- New `export_separate_parts()` method in MusicXMLExporter
+- Enhanced `_transcribe_stem()` in Pipeline to handle ValueError for empty stems
+- Updated CLI commands: `export`, `score`, and `render` with `--separate-parts` option
+
 ## [0.3.0] - 2026-03-14
 
 ### Added

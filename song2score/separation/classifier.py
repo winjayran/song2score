@@ -70,18 +70,20 @@ class InstrumentClassifier:
             "decay_slope": (0.3, 1.5),
         },
         InstrumentClass.STRINGS: {
-            "harmonic_ratio": (0.8, 0.98),
-            "zcr_mean": (0.02, 0.08),
-            "spectral_centroid_mean": (1000, 5000),
-            "attack_time": (0.05, 0.2),  # Slower attack
-            "decay_slope": (0.1, 0.8),  # Very slow decay
+            # Strings are very harmonic, sustained, with slower attack
+            "harmonic_ratio": (0.85, 0.98),  # Very high harmonic content
+            "zcr_mean": (0.01, 0.05),  # Very low ZCR (smooth sound)
+            "spectral_centroid_mean": (1500, 6000),  # Brighter sound
+            "attack_time": (0.08, 0.3),  # Slower attack than vocals
+            "decay_slope": (0.05, 0.5),  # Very slow decay (sustained)
         },
         InstrumentClass.VOCALS: {
-            "harmonic_ratio": (0.5, 0.85),
-            "zcr_mean": (0.08, 0.2),
-            "spectral_centroid_mean": (500, 3500),
-            "attack_time": (0.01, 0.1),
-            "decay_slope": (0.2, 1.2),
+            # Vocals have speech-like patterns, moderate harmonics
+            "harmonic_ratio": (0.45, 0.75),  # Less harmonic than strings
+            "zcr_mean": (0.1, 0.25),  # Higher ZCR (speech transients)
+            "spectral_centroid_mean": (300, 3000),  # Mid-range frequencies
+            "attack_time": (0.01, 0.08),  # Faster attack than strings
+            "decay_slope": (0.3, 1.5),  # Moderate decay
         },
         InstrumentClass.BASS: {
             "harmonic_ratio": (0.6, 0.9),
@@ -130,6 +132,13 @@ class InstrumentClassifier:
         # Extract features
         features = self._extract_features(audio, sample_rate)
 
+        # Special check for vocals before general classification
+        # This helps distinguish vocals from strings which have similar characteristics
+        vocals_score = self._check_vocals_specific(features)
+        if vocals_score >= 0.75:
+            logger.info(f"Detected vocals with special scoring: {vocals_score:.2f}")
+            return InstrumentClass.VOCALS, vocals_score, features
+
         # Score each instrument class
         scores = {}
         for instrument_class in InstrumentClass:
@@ -147,6 +156,73 @@ class InstrumentClassifier:
         logger.info(f"Best match: {best_class} (confidence: {confidence:.2f})")
 
         return best_class, confidence, features
+
+    def _check_vocals_specific(self, features: Dict[str, float]) -> float:
+        """Check if audio has vocal-specific characteristics.
+
+        This method uses specialized features to distinguish vocals from
+        other harmonic instruments like strings, guitar, and piano.
+
+        Args:
+            features: Extracted audio features
+
+        Returns:
+            Vocals confidence score between 0 and 1
+        """
+        score = 0.0
+        weight_sum = 0.0
+
+        # Vocals-specific feature checks
+        # 1. Spectral centroid in vocal range (typical singing: 200-3500 Hz)
+        centroid = features.get("spectral_centroid_mean", 0)
+        if 200 <= centroid <= 3500:
+            score += 1.0
+        elif 3500 < centroid <= 5000:
+            score += 0.5
+        weight_sum += 1.0
+
+        # 2. Harmonic ratio - vocals are moderately harmonic (not as much as strings)
+        harmonic_ratio = features.get("harmonic_ratio", 0)
+        if 0.5 <= harmonic_ratio <= 0.85:
+            score += 1.0
+        elif 0.4 <= harmonic_ratio < 0.5 or 0.85 < harmonic_ratio <= 0.9:
+            score += 0.5
+        weight_sum += 1.0
+
+        # 3. Zero crossing rate - vocals have moderate ZCR
+        zcr = features.get("zcr_mean", 0)
+        if 0.08 <= zcr <= 0.2:
+            score += 1.0
+        elif 0.05 <= zcr < 0.08 or 0.2 < zcr <= 0.25:
+            score += 0.5
+        weight_sum += 1.0
+
+        # 4. Onset rate - vocals have speech-like onset patterns
+        onset_rate = features.get("onset_rate", 0)
+        # Typical syllable rate: 2-8 per second
+        if 2 <= onset_rate <= 8:
+            score += 1.0
+        elif 1 <= onset_rate < 2 or 8 < onset_rate <= 12:
+            score += 0.5
+        weight_sum += 1.0
+
+        # 5. Spectral rolloff - vocals typically have moderate rolloff
+        rolloff = features.get("spectral_rolloff_mean", 0)
+        if 1500 <= rolloff <= 6000:
+            score += 0.5
+        weight_sum += 0.5
+
+        # 6. Check MFCCs for vocal-like timbre
+        # MFCCs 1-4 represent spectral envelope (formants)
+        mfcc_1 = features.get("mfcc_1_mean", 0)
+        # First MFCC typically around -200 to 200 for vocals
+        if -300 <= mfcc_1 <= 300:
+            score += 0.3
+        weight_sum += 0.3
+
+        if weight_sum > 0:
+            return score / weight_sum
+        return 0.0
 
     def classify_file(
         self,

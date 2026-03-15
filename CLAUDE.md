@@ -11,9 +11,10 @@ This document contains implementation notes, architecture decisions, and technic
 **Core Pipeline**:
 1. Audio Preprocessing (ffmpeg) → unified format
 2. Stem Separation (Demucs) → vocals/drums/bass/other (+ guitar/piano with 6-stem)
-3. MIDI Transcription (Basic Pitch, Madmom) → per-part MIDI
-4. MusicXML Export (music21) → score with re-orchestration
-5. PDF Rendering (MuseScore) → printable sheet music
+3. Stem Reclassification (InstrumentClassifier) → correct misclassifications based on content
+4. MIDI Transcription (Basic Pitch, Madmom) → per-part MIDI
+5. MusicXML Export (music21) → score with re-orchestration (combined or separate parts)
+6. PDF Rendering (MuseScore) → printable sheet music
 
 ## Architecture
 
@@ -29,7 +30,8 @@ song2score/
 ├── separation/
 │   ├── demucs.py         # Demucs stem separation (memory-optimized, parallel)
 │   ├── strings.py        # Strings detection from "other" stem
-│   └── classifier.py     # Instrument classification using audio features
+│   ├── classifier.py     # Instrument classification using audio features
+│   └── refinement.py     # Stem refinement to clean up mixed audio (HPSS, frequency filtering)
 ├── transcription/
 │   ├── basic_pitch.py    # Basic Pitch (guitar, piano, violin, general)
 │   └── drums.py          # Drum transcription (Madmom)
@@ -48,6 +50,7 @@ song2score/
 | `DemucsSeparator` | separation/demucs.py | Stem separation with memory & parallel optimization |
 | `StringsSeparator` | separation/strings.py | Strings detection from spectral analysis |
 | `InstrumentClassifier` | separation/classifier.py | Audio feature-based instrument classification |
+| `StemRefiner` | separation/refinement.py | Stem refinement to clean up mixed audio |
 | `BasicPitchTranscriber` | transcription/basic_pitch.py | General MIDI transcription |
 | `GuitarTranscriber` | transcription/basic_pitch.py | Guitar-specific transcription |
 | `PianoTranscriber` | transcription/basic_pitch.py | Piano-specific transcription |
@@ -78,12 +81,121 @@ song2score render MUSICXML --out FILE [OPTIONS]
 
 | Command | Key Options |
 |---------|-------------|
-| `transcribe` | `--stems 4\|6`, `--parts PARTS` |
-| `export` | `--parts PARTS`, `--map MAP`, `--guitar-tab`, `--title TITLE` |
-| `score` | All transcribe options + `--map`, `--guitar-tab`, `--pdf`, `--musescore PATH` |
-| `render` | `--out FILE`, `--format pdf\|png\|svg`, `--resolution DPI`, `--auto-install-musescore` |
+| `transcribe` | `--stems 4\|6`, `--model MODEL`, `--parts PARTS`, `--remap-stems MAP` |
+| `export` | `--parts PARTS`, `--map MAP`, `--guitar-tab`, `--separate-parts`, `--title TITLE` |
+| `score` | All transcribe options + `--map`, `--guitar-tab`, `--separate-parts`, `--pdf`, `--musescore PATH` |
+| `render` | `--out FILE`, `--format pdf\|png\|svg`, `--resolution DPI`, `--separate-parts`, `--auto-install-musescore` |
 
 **Note**: The `render` command uses `--out` (not `--output`) for the output file path.
+
+## Stem Remapping (v0.4.0+)
+
+**File**: `song2score/pipeline.py`
+
+Demucs doesn't always perfectly separate instruments. Sometimes guitar ends up in "other", or drums leak into vocals. song2score provides two ways to handle this:
+
+### Manual Stem Remapping
+
+Use the `--remap-stems` CLI option to manually specify which stem file should be treated as which instrument:
+
+```bash
+# Example: If Demucs put guitar in "other" and drums in "vocals"
+song2score transcribe input.mp3 --out output/ --remap-stems other=guitar,vocals=drums
+```
+
+This is useful when:
+- The stem separation model consistently misclassifies a particular instrument
+- You want to override the default stem assignments
+- Working with specific songs where Demucs makes predictable errors
+
+### Auto-Correction (Experimental)
+
+The pipeline can automatically detect and correct stem misclassifications using audio feature analysis:
+
+```python
+stems = pipeline._verify_and_correct_stem_classification(
+    stems,
+    auto_correct=True,      # Enable auto-correction
+    min_confidence=0.65,    # Minimum confidence for correction
+)
+```
+
+**How it works**:
+1. Each stem is analyzed using `InstrumentClassifier`
+2. If confidence is high (≥65%), the stem is reassigned to the detected type
+3. Conflicts are resolved by keeping the stem with the highest confidence
+
+**Limitations**:
+- Works best for clear, unmixed instrument sounds
+- May misclassify heavily processed or mixed audio
+- Cannot fix stems that contain multiple instruments (e.g., bass + piano mixed)
+
+**Current Issues**: The auto-correction is limited by the quality of Demucs output. If a stem contains multiple instruments (e.g., bass.wav contains both bass AND piano), the classifier will only detect the dominant instrument.
+
+## Stem Refinement (v0.5.0+)
+
+**File**: `song2score/separation/refinement.py`
+
+When Demucs output contains mixed audio (e.g., drums leaking into vocals, or high-frequency instruments in bass), the stem refinement module can help clean up the stems using audio processing techniques.
+
+### Techniques Used
+
+1. **Harmonic-Percussive Source Separation (HPSS)**
+   - Separates audio into harmonic (melodic) and percussive (drums) components
+   - For melodic instruments: keeps harmonic, attenuates percussive
+   - For drums: keeps percussive, attenuates harmonic
+
+2. **Frequency Band Filtering**
+   - Each instrument has a characteristic frequency range
+   - Applies bandpass filter to isolate relevant frequencies
+   - Removes out-of-range content that may be from other instruments
+
+### CLI Usage
+
+```bash
+# Apply stem refinement during transcription
+song2score transcribe input.mp3 --out output/ --refine-stems
+
+# Apply stem refinement during score generation
+song2score score input.mp3 --out output/ --refine-stems --pdf
+```
+
+### Python API
+
+```python
+from song2score.separation.refinement import StemRefiner
+
+refiner = StemRefiner(
+    use_harmonic_mask=True,    # Apply HPSS for melodic instruments
+    use_percussive_mask=True,  # Apply HPSS for drums
+    use_frequency_filter=True, # Apply frequency band filtering
+    margin=2.0,                # HPSS margin (higher = more aggressive)
+)
+
+# Refine a single stem
+refined_path, metadata = refiner.refine_stem(
+    stem_path="stems/vocals.wav",
+    part_type=PartType.VOCALS,
+    output_path="stems/vocals_refined.wav",
+)
+```
+
+### Frequency Ranges
+
+| Instrument | Frequency Range (Hz) |
+|-----------|---------------------|
+| Bass | 20 - 250 |
+| Drums | 30 - 5000 |
+| Guitar | 80 - 5000 |
+| Piano | 28 - 4200 |
+| Strings | 200 - 8000 |
+| Vocals | 80 - 3500 |
+
+### Limitations
+
+- **Cannot fully separate mixed instruments**: If two instruments occupy the same frequency range and have similar harmonic/percussive characteristics, refinement won't fully separate them
+- **May affect audio quality**: Aggressive filtering can remove desirable frequencies
+- **Instrument-specific settings**: Different instruments may require different settings for optimal results
 
 ## Lazy Loading and Warning Suppression
 
@@ -195,16 +307,70 @@ segments = classifier.classify_segments(audio_path)
 
 **Integration with Pipeline**:
 
-The pipeline uses the classifier to log the detected instrument types in each stem:
+The pipeline uses the classifier to automatically correct stem misclassifications:
 
 ```python
-stems = pipeline._verify_and_correct_stem_classification(stems)
+stems = pipeline._verify_and_correct_stem_classification(
+    stems,
+    auto_correct=True,      # Enable auto-correction
+    min_confidence=0.65,    # Minimum confidence for correction
+)
 ```
 
-**Note**: The classifier logs detected instrument types but does NOT change the stem classifications. Demucs stem separation is already well-optimized, and isolated stems may exhibit unexpected characteristics when analyzed individually (e.g., an isolated "vocals" stem might sound string-like without the original mix context). The classification output is useful for:
-- Debugging and understanding stem content
-- Quality assessment
-- Future improvements to the separation models
+**Stem Reclassification** (v0.4.0+):
+
+When `auto_correct=True`, the pipeline will:
+1. Classify the actual content of each stem
+2. If confidence is high enough (≥65%), reassign the stem to the correct type
+3. Handle conflicts when multiple stems map to the same detected type
+
+This helps when Demucs misassigns instruments (e.g., guitar content ends up in "other").
+
+## Empty Stem Handling
+
+**File**: `song2score/transcription/basic_pitch.py`
+
+The transcription now validates audio content before processing to avoid errors with empty or silent stems:
+
+**Validation Checks**:
+- Minimum duration (default 0.5 seconds)
+- RMS energy level (detects silent audio)
+- Significant signal ratio (detects mostly-silent audio)
+
+```python
+def _has_sufficient_audio(self, audio: np.ndarray, sr: int, min_duration: float = 0.5) -> Tuple[bool, str]:
+    """Check if audio has sufficient content for transcription."""
+    # Returns (has_content, reason)
+```
+
+When a stem has insufficient content:
+- The transcription is skipped with a warning
+- Pipeline continues processing other stems
+- Error is logged as "Skipped" rather than "Failed"
+
+## Separate Parts Export
+
+**File**: `song2score/export/musicxml.py`
+
+The `MusicXMLExporter` can now create individual MusicXML files for each instrument part:
+
+```python
+exported_parts = exporter.export_separate_parts(
+    midi_files=midi_files,
+    output_dir=output_dir / "parts",
+    title="My Song",
+)
+# Returns: {PartType.VOCALS: Path(.../vocals.musicxml), ...}
+```
+
+**CLI Usage**:
+```bash
+# Export separate MusicXML files for each part
+song2score export midi_dir --out output --separate-parts
+
+# Generate separate PDFs for each part
+song2score score input.mp3 --out output --separate-parts --pdf
+```
 
 ## Stem Separation
 
@@ -476,6 +642,22 @@ output/
 See `CHANGELOG.md` for detailed version history.
 
 **Recent versions**:
+- **v0.5.0** (2026-03-15): Stem refinement and classification improvements
+  - Conservative stem reclassification (only "other" stem to avoid conflicts)
+  - Stem refinement module (HPSS, frequency filtering) to clean up mixed audio
+  - Improved vocals detection with specialized feature scoring
+  - New `--refine-stems` CLI option
+  - Fixed phantom stem creation bug
+  - New `--model` and `--remap-stems` CLI options
+
+- **v0.4.0** (2026-03-14): Stem reclassification and separate parts export
+  - Automatic stem reclassification based on audio content analysis
+  - Manual stem remapping via `--remap-stems` CLI option
+  - Separate MusicXML/PDF export for individual instrument parts
+  - Improved empty stem handling (skips gracefully instead of failing)
+  - Better error handling in Basic Pitch transcription
+  - New `--model` option to specify Demucs model directly
+
 - **v0.3.0** (2026-03-14): Performance improvements, better layout
   - Parallel segment processing for stem separation (2-4x faster)
   - Parallel MIDI transcription for multiple stems
@@ -536,6 +718,64 @@ See `CHANGELOG.md` for detailed version history.
 4. **Update .gitignore** for new temporary files
    - Add patterns for any new temp directories or cache files
    - Exclude test outputs and large generated files
+
+5. **Update Version History** in CLAUDE.md
+   - Add new version entries after releases
+   - Document breaking changes for developers
+
+6. **Track Current Issues and Update Plans** in CLAUDE.md
+   - Document known limitations and bugs
+   - Track planned improvements and features
+   - Note areas that need refactoring or improvement
+
+## Current Issues and Update Plans
+
+### Known Issues (v0.5.0)
+
+1. **Stem Separation Quality** (RESOLVED)
+   - **Previous Issue**: Demucs doesn't perfectly separate instruments. Stems often contain mixed audio (e.g., bass.wav contains piano + strings, vocals.wav contains drums)
+   - **Current Workarounds**:
+     - Use `--remap-stems` to override stem assignments when consistent errors occur
+     - Use `--refine-stems` to apply HPSS and frequency filtering to clean up mixed audio
+   - **Status**: Stem refinement module added in v0.5.0 helps but cannot fully separate mixed instruments
+
+2. **Instrument Classification Accuracy** (IMPROVED)
+   - **Previous Issue**: The `InstrumentClassifier` uses heuristic feature ranges which may misclassify heavily processed audio
+   - **Current Behavior**:
+     - Improved vocals detection with specialized feature scoring
+     - Classification is now conservative - only reclassifies "other" stem to avoid conflicts
+     - Works well for clear instrument sounds, still struggles with heavily processed audio
+   - **Planned Fix**: Train ML model on instrument datasets for better accuracy
+
+3. **Drum Transcription** (UNRESOLVED)
+   - **Issue**: Madmom import fails with current version
+   - **Workaround**: Drums stem is still created for manual processing
+   - **Planned Fix**: Update to compatible drum transcription or alternative library
+
+4. **Vocals vs Strings Confusion** (IMPROVED)
+   - **Previous Issue**: Vocals often misclassified as strings due to similar harmonic characteristics
+   - **Current Behavior**: Specialized vocals detection with speech-like pattern analysis improves accuracy
+   - **Remaining**: Can still confuse with very smooth string sections
+
+### Update Plans (v0.6.0+)
+
+1. **Improved Drum Transcription**
+   - Replace Madmom with alternative library (e.g., pretty_midi drum patterns, beat tracking)
+   - Implement drum pattern recognition from audio features
+
+2. **Better Classification**
+   - Collect training data for various instruments
+   - Train custom classifier model using sklearn/pytorch
+   - Add confidence-based warnings for uncertain classifications
+
+3. **User Experience**
+   - Add `--verbose` option for detailed logging
+   - Better progress reporting during long operations
+   - HTML report generation for analysis results
+
+4. **Performance**
+   - Adaptive parallel processing based on available memory
+   - Faster stem separation with model optimization
 
 ## Testing
 

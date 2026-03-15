@@ -127,6 +127,21 @@ def transcribe(
         "-s",
         help="Number of stems for separation (4 or 6)",
     ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Demucs model name (auto-selected based on --stems if not specified)",
+    ),
+    remap_stems: Optional[str] = typer.Option(
+        None,
+        "--remap-stems",
+        help="Manually remap stems (e.g., 'vocals=drums,other=vocals,bass=strings')",
+    ),
+    refine_stems: bool = typer.Option(
+        False,
+        "--refine-stems",
+        help="Apply stem refinement to clean up mixed audio (experimental)",
+    ),
 ) -> None:
     """Separate and transcribe audio to MIDI.
 
@@ -136,6 +151,17 @@ def transcribe(
     rprint(f"[dim]Input:[/dim] {input}")
     rprint(f"[dim]Output:[/dim] {out}")
     rprint(f"[dim]Stems:[/dim] {stems}")
+
+    # Auto-select model based on stem count if not specified
+    if model is None:
+        if stems == 6:
+            model = "htdemucs_6s"
+            rprint(f"[dim]Model:[/dim] {model} (auto-selected for 6 stems)")
+        else:
+            model = "htdemucs_ft"
+            rprint(f"[dim]Model:[/dim] {model} (auto-selected for 4 stems)")
+    else:
+        rprint(f"[dim]Model:[/dim] {model}")
 
     # Parse parts
     part_list: Optional[List[PartType]] = None
@@ -148,17 +174,31 @@ def transcribe(
             except ValueError:
                 rprint(f"[yellow]Warning:[/yellow] Unknown part '{name}', skipping")
 
+    # Parse stem remapping
+    stem_remap: Dict[PartType, PartType] = {}
+    if remap_stems:
+        for mapping in remap_stems.split(","):
+            try:
+                src, dst = mapping.strip().split("=")
+                stem_remap[PartType(src)] = PartType(dst)
+            except ValueError:
+                rprint(f"[yellow]Warning:[/yellow] Invalid remap '{mapping}', skipping")
+
     with console.status("[bold green]Processing...") as status:
         status.update("Transcribing audio...")
 
         try:
-            QuickTranscribe = _get_quick_transcribe()
-            report = QuickTranscribe.transcribe(
-                input_path=input,
+            from song2score.types import StemConfig
+            stem_config = StemConfig(model=model)
+            Pipeline = _get_pipeline()
+            pipeline = Pipeline(
                 output_dir=out,
-                parts=part_list,
+                stem_config=stem_config,
                 device="cpu",
+                stem_remap=stem_remap if stem_remap else None,
+                refine_stems=refine_stems,
             )
+            report = pipeline.run(input_path=input, parts=part_list)
 
             # Show results
             rprint("\n[bold green]✓ Transcription complete![/bold green]")
@@ -209,7 +249,7 @@ def export(
         "-p",
         help=f"Comma-separated parts to include: {','.join(VALID_PARTS)}",
     ),
-    map: Optional[str] = typer.Option(
+    map_instruments: Optional[str] = typer.Option(
         None,
         "--map",
         "-m",
@@ -219,6 +259,11 @@ def export(
         False,
         "--guitar-tab",
         help="Enable guitar TAB output",
+    ),
+    separate_parts: bool = typer.Option(
+        False,
+        "--separate-parts",
+        help="Export each part as a separate MusicXML file",
     ),
     title: str = typer.Option(
         "Transcribed Score",
@@ -230,7 +275,8 @@ def export(
     """Export MIDI files to MusicXML score.
 
     Combines MIDI files into a single MusicXML score with optional
-    re-orchestration and guitar TAB.
+    re-orchestration and guitar TAB. Use --separate-parts to create
+    individual MusicXML files for each instrument part.
     """
     rprint(f"[bold cyan]song2score[/bold cyan] - Export mode")
 
@@ -249,8 +295,8 @@ def export(
 
     # Parse instrument mapping
     instrument_map: dict = {}
-    if map:
-        for mapping in map.split(","):
+    if map_instruments:
+        for mapping in map_instruments.split(","):
             try:
                 src, dst = mapping.strip().split("=")
                 instrument_map[PartType(src)] = dst
@@ -283,18 +329,35 @@ def export(
     exporter = MusicXMLExporter(config)
 
     with console.status("[bold green]Exporting...") as status:
-        status.update("Creating MusicXML score...")
-
         try:
-            output_path = out / "musicxml" / "score.musicxml"
-            output_path, metadata = exporter.export(
-                midi_files=midi_files,
-                output_path=output_path,
-                title=title,
-            )
+            if separate_parts:
+                status.update("Creating separate MusicXML files for each part...")
 
-            rprint("\n[bold green]✓ Export complete![/bold green]")
-            rprint(f"[dim]Output:[/dim] {output_path}")
+                parts_dir = out / "musicxml" / "parts"
+                exported_parts = exporter.export_separate_parts(
+                    midi_files=midi_files,
+                    output_dir=parts_dir,
+                    title=title,
+                )
+
+                rprint("\n[bold green]✓ Export complete![/bold green]")
+                rprint(f"[dim]Output directory:[/dim] {parts_dir}")
+                rprint(f"[bold]Parts exported:[/bold]")
+                for part_type, path in exported_parts.items():
+                    rprint(f"  • {part_type.value}: {path.name}")
+
+            else:
+                status.update("Creating MusicXML score...")
+
+                output_path = out / "musicxml" / "score.musicxml"
+                output_path, metadata = exporter.export(
+                    midi_files=midi_files,
+                    output_path=output_path,
+                    title=title,
+                )
+
+                rprint("\n[bold green]✓ Export complete![/bold green]")
+                rprint(f"[dim]Output:[/dim] {output_path}")
 
         except Exception as e:
             rprint(f"[bold red]Error:[/bold red] {e}")
@@ -306,7 +369,7 @@ def render(
     musicxml: Path = typer.Argument(
         ...,
         exists=True,
-        help="Input MusicXML file",
+        help="Input MusicXML file or directory containing part MusicXML files",
     ),
     out: Path = typer.Option(
         None,
@@ -326,6 +389,11 @@ def render(
         "-r",
         help="Resolution for PNG (DPI)",
     ),
+    separate_parts: bool = typer.Option(
+        False,
+        "--separate-parts",
+        help="Render each part separately (input must be a directory with part MusicXML files)",
+    ),
     auto_install: bool = typer.Option(
         False,
         "--auto-install-musescore",
@@ -336,6 +404,9 @@ def render(
 
     Requires MuseScore to be installed. Use --auto-install-musescore to automatically
     download a portable version (Linux only).
+
+    For separate parts: Use --separate-parts with a directory containing individual
+    part MusicXML files (e.g., from 'song2score export' with --separate-parts flag).
     """
     rprint(f"[bold cyan]song2score[/bold cyan] - Render mode")
 
@@ -354,24 +425,70 @@ def render(
         rprint(f"[dim]MuseScore version:[/dim] {version}")
 
     with console.status("[bold green]Rendering...") as status:
-        status.update(f"Rendering to {format.upper()}...")
-
         try:
-            if out is None:
-                out = musicxml.with_suffix(f".{format}")
+            if separate_parts:
+                # Render all MusicXML files in a directory
+                if not musicxml.is_dir():
+                    rprint(f"[bold red]Error:[/bold red] --separate-parts requires a directory")
+                    raise typer.Exit(1)
 
-            if format.lower() == "pdf":
-                output_path, _ = renderer.render_to_pdf(musicxml, out)
-            elif format.lower() == "png":
-                output_path, _ = renderer.render_to_png(musicxml, out, resolution)
-            elif format.lower() == "svg":
-                output_path, _ = renderer.render_to_svg(musicxml, out)
+                # Find all MusicXML files
+                musicxml_files = list(musicxml.glob("*.musicxml")) + list(musicxml.glob("*.xml"))
+                if not musicxml_files:
+                    rprint(f"[bold red]Error:[/bold red] No MusicXML files found in {musicxml}")
+                    raise typer.Exit(1)
+
+                # Set output directory
+                if out is None:
+                    output_dir = musicxml.parent / "parts_pdf"
+                else:
+                    output_dir = Path(out)
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                rendered_files = []
+                for mx_file in musicxml_files:
+                    status.update(f"Rendering {mx_file.name}...")
+                    output_path = output_dir / f"{mx_file.stem}.{format}"
+
+                    try:
+                        if format.lower() == "pdf":
+                            result_path, _ = renderer.render_to_pdf(mx_file, output_path)
+                        elif format.lower() == "png":
+                            result_path, _ = renderer.render_to_png(mx_file, output_path, resolution)
+                        elif format.lower() == "svg":
+                            result_path, _ = renderer.render_to_svg(mx_file, output_path)
+                        else:
+                            rprint(f"[bold red]Error:[/bold red] Unknown format '{format}'")
+                            raise typer.Exit(1)
+
+                        rendered_files.append(result_path)
+                    except Exception as e:
+                        rprint(f"[yellow]Warning:[/yellow] Failed to render {mx_file.name}: {e}")
+
+                rprint("\n[bold green]✓ Render complete![/bold green]")
+                rprint(f"[dim]Rendered {len(rendered_files)} parts to:[/dim] {output_dir}")
+                for f in rendered_files:
+                    rprint(f"  • {f.name}")
+
             else:
-                rprint(f"[bold red]Error:[/bold red] Unknown format '{format}'")
-                raise typer.Exit(1)
+                # Render single file
+                status.update(f"Rendering to {format.upper()}...")
 
-            rprint("\n[bold green]✓ Render complete![/bold green]")
-            rprint(f"[dim]Output:[/dim] {output_path}")
+                if out is None:
+                    out = musicxml.with_suffix(f".{format}")
+
+                if format.lower() == "pdf":
+                    output_path, _ = renderer.render_to_pdf(musicxml, out)
+                elif format.lower() == "png":
+                    output_path, _ = renderer.render_to_png(musicxml, out, resolution)
+                elif format.lower() == "svg":
+                    output_path, _ = renderer.render_to_svg(musicxml, out)
+                else:
+                    rprint(f"[bold red]Error:[/bold red] Unknown format '{format}'")
+                    raise typer.Exit(1)
+
+                rprint("\n[bold green]✓ Render complete![/bold green]")
+                rprint(f"[dim]Output:[/dim] {output_path}")
 
         except Exception as e:
             rprint(f"[bold red]Error:[/bold red] {e}")
@@ -398,7 +515,28 @@ def score(
         "-p",
         help=f"Comma-separated parts to include: {','.join(VALID_PARTS)}",
     ),
-    map: Optional[str] = typer.Option(
+    stems: int = typer.Option(
+        4,
+        "--stems",
+        "-s",
+        help="Number of stems for separation (4 or 6)",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Demucs model name (auto-selected based on --stems if not specified)",
+    ),
+    remap_stems: Optional[str] = typer.Option(
+        None,
+        "--remap-stems",
+        help="Manually remap stems (e.g., 'vocals=drums,other=vocals,bass=strings')",
+    ),
+    refine_stems: bool = typer.Option(
+        False,
+        "--refine-stems",
+        help="Apply stem refinement to clean up mixed audio (experimental)",
+    ),
+    map_instruments: Optional[str] = typer.Option(
         None,
         "--map",
         "-m",
@@ -408,6 +546,11 @@ def score(
         False,
         "--guitar-tab",
         help="Enable guitar TAB output",
+    ),
+    separate_parts: bool = typer.Option(
+        False,
+        "--separate-parts",
+        help="Export each part as a separate MusicXML file",
     ),
     title: str = typer.Option(
         "Transcribed Score",
@@ -429,13 +572,28 @@ def score(
     """Complete pipeline: transcribe and export to MusicXML (+ optional PDF).
 
     This command combines transcription and export into one step.
-    Use --pdf to also generate a PDF file (requires MuseScore).
+    Use --pdf to generate separate PDF files for each part (requires MuseScore).
+    Use --separate-parts to create individual MusicXML files for each part.
     """
     rprint(f"[bold cyan]song2score[/bold cyan] - Score mode")
     rprint(f"[dim]Input:[/dim] {input}")
     rprint(f"[dim]Output:[/dim] {out}")
+    rprint(f"[dim]Stems:[/dim] {stems}")
     if pdf:
         rprint(f"[dim]PDF output:[/dim] Enabled")
+    if separate_parts:
+        rprint(f"[dim]Separate parts:[/dim] Enabled")
+
+    # Auto-select model based on stem count if not specified
+    if model is None:
+        if stems == 6:
+            model = "htdemucs_6s"
+            rprint(f"[dim]Model:[/dim] {model} (auto-selected for 6 stems)")
+        else:
+            model = "htdemucs_ft"
+            rprint(f"[dim]Model:[/dim] {model} (auto-selected for 4 stems)")
+    else:
+        rprint(f"[dim]Model:[/dim] {model}")
 
     # Parse parts
     part_list: Optional[List[PartType]] = None
@@ -450,26 +608,53 @@ def score(
 
     # Parse instrument mapping
     instrument_map: dict = {}
-    if map:
-        for mapping in map.split(","):
+    if map_instruments:
+        for mapping in map_instruments.split(","):
             try:
                 src, dst = mapping.strip().split("=")
                 instrument_map[PartType(src)] = dst
             except ValueError:
                 rprint(f"[yellow]Warning:[/yellow] Invalid mapping '{mapping}', skipping")
 
+    # Parse stem remapping
+    stem_remap: Dict[PartType, PartType] = {}
+    if remap_stems:
+        for mapping in remap_stems.split(","):
+            try:
+                src, dst = mapping.strip().split("=")
+                stem_remap[PartType(src)] = PartType(dst)
+            except ValueError:
+                rprint(f"[yellow]Warning:[/yellow] Invalid remap '{mapping}', skipping")
+
     with console.status("[bold green]Processing...") as status:
         status.update("Transcribing and exporting...")
 
         try:
-            QuickTranscribe = _get_quick_transcribe()
-            report = QuickTranscribe.to_score(
-                input_path=input,
-                output_dir=out,
-                parts=part_list,
+            Pipeline = _get_pipeline()
+            from song2score.types import StemConfig, ExportConfig
+
+            stem_config = StemConfig(model=model)
+            export_config = ExportConfig(
+                parts=part_list or [PartType.VOCALS, PartType.GUITAR, PartType.PIANO, PartType.BASS],
                 instrument_map=instrument_map,
-                device="cpu",
+                guitar_tab=guitar_tab,
             )
+
+            pipeline = Pipeline(
+                output_dir=out,
+                stem_config=stem_config,
+                export_config=export_config,
+                device="cpu",
+                stem_remap=stem_remap if stem_remap else None,
+                refine_stems=refine_stems,
+            )
+
+            report = pipeline.run(input_path=input, parts=part_list)
+
+            # Update export_config to include all successfully transcribed parts
+            if report.midi_produced:
+                export_config.parts = list(report.midi_produced.keys())
+                pipeline.exporter.config.parts = export_config.parts
 
             # Show results
             rprint("\n[bold green]✓ Score generation complete![/bold green]")
@@ -479,22 +664,63 @@ def score(
                 for part, path in report.midi_produced.items():
                     rprint(f"  • {part.value}: {path}")
 
-            if report.musicxml_produced:
-                rprint(f"\n[bold]MusicXML:[/bold] {report.musicxml_produced}")
+            # Export separate parts (always do this when pdf is requested)
+            separate_musicxml_paths = {}
+            if (separate_parts or pdf) and report.midi_produced:
+                status.update("Creating separate MusicXML files for each part...")
 
-            # Try to render PDF
-            if pdf and report.musicxml_produced:
+                parts_dir = out / "musicxml" / "parts"
+                parts_dir.mkdir(parents=True, exist_ok=True)
+
+                exporter = pipeline.exporter
+                separate_musicxml_paths = exporter.export_separate_parts(
+                    midi_files=report.midi_produced,
+                    output_dir=parts_dir,
+                    title=title,
+                )
+
+                if separate_musicxml_paths:
+                    rprint(f"\n[bold]Separate MusicXML parts:[/bold]")
+                    for part_type, path in separate_musicxml_paths.items():
+                        rprint(f"  • {part_type.value}: {path.name}")
+
+            if report.musicxml_produced:
+                rprint(f"\n[bold]Combined MusicXML:[/bold] {report.musicxml_produced}")
+
+            # Try to render PDFs
+            pdf_paths = []
+            if pdf:
                 renderer = MuseScoreRenderer(executable_path=musescore_path, auto_install=True)
                 if renderer.is_available():
-                    status.update("Rendering to PDF...")
-                    try:
-                        pdf_path = out / "score.pdf"
-                        pdf_path, _ = renderer.render_to_pdf(report.musicxml_produced, pdf_path)
-                        rprint(f"[bold]PDF:[/bold] {pdf_path}")
-                    except Exception as e:
-                        rprint(f"[yellow]PDF rendering failed:[/yellow] {e}")
-                        rprint("[dim]Install MuseScore to enable PDF rendering:[/dim]")
-                        rprint("[dim]  https://musescore.org/en/download[/dim]")
+                    # Render separate part PDFs (always when pdf is requested)
+                    if separate_musicxml_paths:
+                        status.update("Rendering separate part PDFs...")
+                        parts_pdf_dir = out / "parts_pdf"
+                        parts_pdf_dir.mkdir(parents=True, exist_ok=True)
+
+                        for part_type, musicxml_path in separate_musicxml_paths.items():
+                            try:
+                                pdf_path = parts_pdf_dir / f"{part_type.value}.pdf"
+                                result_path, _ = renderer.render_to_pdf(musicxml_path, pdf_path)
+                                pdf_paths.append(result_path)
+                            except Exception as e:
+                                rprint(f"[yellow]PDF rendering failed for {part_type.value}:[/yellow] {e}")
+
+                    # Also render combined score if it exists
+                    if report.musicxml_produced:
+                        status.update("Rendering combined score to PDF...")
+                        try:
+                            pdf_path = out / "score.pdf"
+                            result_path, _ = renderer.render_to_pdf(report.musicxml_produced, pdf_path)
+                            pdf_paths.append(result_path)
+                        except Exception as e:
+                            rprint(f"[yellow]Combined PDF rendering failed:[/yellow] {e}")
+
+                    # Show PDF results
+                    if pdf_paths:
+                        rprint(f"\n[bold]PDFs rendered:[/bold]")
+                        for pdf_path in pdf_paths:
+                            rprint(f"  • {pdf_path}")
                 else:
                     rprint("[yellow]MuseScore not found - PDF rendering skipped[/yellow]")
                     rprint("[dim]Install MuseScore to use --pdf option:[/dim]")

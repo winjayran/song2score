@@ -162,7 +162,10 @@ song2score transcribe INPUT --out DIR [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--stems 4\|6` | Number of stems for separation (default: 4) |
+| `--model MODEL` | Demucs model name (auto-selected based on --stems if not specified) |
 | `--parts PARTS` | Comma-separated parts to process |
+| `--remap-stems MAP` | Manually remap stems (e.g., `vocals=drums,other=vocals`) |
+| `--refine-stems` | Apply stem refinement to clean up mixed audio (experimental) |
 | `--out DIR` | Output directory |
 
 ### `song2score export`
@@ -178,6 +181,7 @@ song2score export MIDI_DIR --out DIR [OPTIONS]
 | `--parts PARTS` | Parts to include in score |
 | `--map MAP` | Instrument mapping (e.g., `vocals=violin,bass=contrabass`) |
 | `--guitar-tab` | Enable guitar TAB output |
+| `--separate-parts` | Export each part as a separate MusicXML file |
 | `--title TITLE` | Score title |
 
 ### `song2score score`
@@ -193,8 +197,13 @@ All `transcribe` options plus:
 |--------|-------------|
 | `--map MAP` | Instrument re-orchestration mapping |
 | `--guitar-tab` | Enable guitar TAB |
+| `--separate-parts` | Export each part as a separate MusicXML file |
 | `--pdf` | Also render to PDF |
 | `--musescore PATH` | Path to MuseScore executable |
+
+**Notes:**
+- Use `--remap-stems` when Demucs misclassifies instruments. For example, if guitar ends up in "other", use `--remap-stems other=guitar`.
+- Use `--refine-stems` to apply audio processing techniques (HPSS, frequency filtering) to clean up stems that contain mixed audio. This can help reduce drum bleed in vocals or high-frequency instruments in bass.
 
 ### `song2score render`
 
@@ -208,6 +217,7 @@ song2score render MUSICXML --out FILE [OPTIONS]
 |--------|-------------|
 | `--format pdf\|png\|svg` | Output format (default: pdf) |
 | `--resolution DPI` | Resolution for PNG (default: 300) |
+| `--separate-parts` | Render each part separately (input must be a directory) |
 | `--auto-install-musescore` | Auto-download portable MuseScore (Linux) |
 
 ## Supported Parts
@@ -251,7 +261,9 @@ song2score/
 │   │   └── preprocess.py     # Audio preprocessing with ffmpeg
 │   ├── separation/
 │   │   ├── demucs.py         # Demucs stem separation (memory-optimized)
-│   │   └── strings.py        # Strings detection/separation
+│   │   ├── strings.py        # Strings detection/separation
+│   │   ├── classifier.py     # Instrument classification using audio features
+│   │   └── refinement.py     # Stem refinement to clean up mixed audio (v0.5.0)
 │   ├── transcription/
 │   │   ├── basic_pitch.py    # Basic Pitch (guitar, piano, violin, general)
 │   │   └── drums.py          # Drum transcription (Madmom)
@@ -285,7 +297,13 @@ The `DemucsSeparator` is optimized for systems with ~10GB RAM:
 - [x] MusicXML export with re-orchestration
 - [x] PDF rendering (MuseScore integration)
 - [x] Multiple audio format support
-- [ ] Improved strings separation (iterative refinement)
+- [x] Stem reclassification based on audio content (v0.4.0)
+- [x] Separate parts export and PDF generation (v0.4.0)
+- [x] Improved empty stem handling (v0.4.0)
+- [x] Stem refinement to clean up mixed audio (v0.5.0)
+- [x] Manual stem remapping via --remap-stems (v0.5.0)
+- [x] Improved vocals detection (v0.5.0)
+- [ ] Improved drum transcription (replace Madmom)
 - [ ] Web UI (FastAPI) + job queue
 - [ ] Evaluation metrics and confidence scoring
 - [ ] Multi-song batch processing
